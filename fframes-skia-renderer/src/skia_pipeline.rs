@@ -163,13 +163,24 @@ pub(crate) fn render<'p, 'a, 'media: 'a, TVideo: Video + Sync + Send, TBackend: 
         render_options,
         &logger,
     );
-    let (encoder_input, hardware_encoder) = writer
+    let (encoder_input, hardware_encoder, unlimited_sessions) = writer
         .encoder_info()
         .and_then(|encoder| {
-            crate::frame_export::negotiate(skia, frame_export, &encoder)
-                .map(|input| (input, encoder.is_hardware()))
+            crate::frame_export::negotiate(skia, frame_export, &encoder).map(|input| {
+                (
+                    input,
+                    encoder.is_hardware(),
+                    // Apple's media engine has no session limit
+                    encoder.name().ends_with("_videotoolbox"),
+                )
+            })
         })
         .map_err(|err| FFramesRendererError::RenderChunkError(0, err))?;
+
+    let gpu_video_frames = skia.shares_device_with_decoders(&encoder_input);
+    let writer = writer
+        .with_encoder_input(encoder_input)
+        .with_hardware_encoder(hardware_encoder);
 
     // Generators own the segments, so their count also caps how many segments encode at
     // once. Half of the threads keeps the GPU fed and is enough for hardware encoders. A
@@ -179,8 +190,13 @@ pub(crate) fn render<'p, 'a, 'media: 'a, TVideo: Video + Sync + Send, TBackend: 
     // renders twice as fast as with half. Each encoder buffers its lookahead frames, so
     // `SOFTWARE_ENCODERS_MEMORY` caps the count (4K stays at half of the threads).
     let generators = (workers / 2).max(1);
-    let generators = if hardware_encoder {
+    let generators = if hardware_encoder && unlimited_sessions {
         generators
+    } else if hardware_encoder {
+        // Hardware encoders can refuse a session when too many are open (NVIDIA's consumer
+        // GPUs allow 8 on current drivers, fewer elsewhere), so find out how many segments
+        // the device encodes at once.
+        fframes::concurrent_segments(generators, writer.probe_encoder_sessions(generators * 2))
     } else {
         let frame_bytes = ctx.current_video_size.width
             * ctx.current_video_size.height
@@ -200,8 +216,6 @@ pub(crate) fn render<'p, 'a, 'media: 'a, TVideo: Video + Sync + Send, TBackend: 
             .video_encoder_options
             .min_segment_frames(ctx.time_base.fps),
     );
-    let gpu_video_frames = skia.shares_device_with_decoders(&encoder_input);
-    let writer = writer.with_encoder_input(encoder_input);
 
     #[cfg(feature = "debug")]
     let metrics = crate::metrics::PipelineMetrics::new(generators, gpu_contexts, workers);

@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use super::FFramesLogger;
 use super::concatenator::AvPacketAutoFree;
@@ -10,8 +12,90 @@ use super::renderer_error::{RenderEncodingError, RenderEncodingResult};
 use super::scheduler::FrameClaim;
 use crate::RenderOptions;
 
+/// How long a segment waits for a hardware encoder session before the render fails with the
+/// encoder's error. Sessions are released within milliseconds when a segment ends, so this is
+/// far longer than a healthy render ever waits.
+const SESSION_WAIT: Duration = Duration::from_secs(60);
+
+/// How long the first segment of a render waits for a session after the probe closed its own:
+/// the driver may release them a moment later than the encoders are dropped.
+const PROBE_RELEASE_GRACE: Duration = Duration::from_secs(2);
+
+/// Pause between two attempts to open an encoder while other segments hold sessions. Waiting
+/// for a segment to end is woken up sooner; this covers a driver that releases a session a
+/// moment after the encoder was closed.
+const SESSION_RETRY: Duration = Duration::from_millis(100);
+
+/// The encoder sessions of the open segments of a writer. Hardware encoders can refuse a new
+/// session (NVIDIA's consumer GPUs allow a handful of concurrent encodes; the limit depends on
+/// the GPU and the driver), and there is no portable way to ask for the limit.
+#[derive(Default)]
+struct Sessions {
+    open: Mutex<usize>,
+    released: Condvar,
+}
+
+impl Sessions {
+    /// Calls `open`. When it fails while other segments hold sessions the device may have
+    /// refused one, so it is called again as they end, for up to `wait`. It fails at once
+    /// when no other session is open (nothing to wait for, the encoder is broken) or `wait`
+    /// is zero (software encoders), unless `alone` allows a short retry for sessions that
+    /// are still being released.
+    fn open_with_retry<T, E>(
+        this: &Arc<Self>,
+        (wait, alone): (Duration, Duration),
+        retry: Duration,
+        mut open: impl FnMut() -> Result<T, E>,
+    ) -> Result<(T, SessionPermit), E> {
+        let started = Instant::now();
+        loop {
+            match open() {
+                Ok(opened) => {
+                    *this
+                        .open
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+                    return Ok((opened, SessionPermit(Arc::clone(this))));
+                }
+                Err(err) => {
+                    let open = this
+                        .open
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let limit = if *open == 0 { alone } else { wait };
+                    if started.elapsed() >= limit {
+                        return Err(err);
+                    }
+                    // a segment that ends wakes this up; the timeout covers a slow release
+                    drop(
+                        this.released
+                            .wait_timeout(open, retry)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// One open encoder session, given back when the segment ends.
+struct SessionPermit(Arc<Sessions>);
+
+impl Drop for SessionPermit {
+    fn drop(&mut self) {
+        *self
+            .0
+            .open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) -= 1;
+        self.0.released.notify_all();
+    }
+}
+
 struct Segment {
     encoder: Encoder,
+    /// Declared after the encoder: the session is released once the encoder is closed.
+    _session: SessionPermit,
     packet: AvPacketAutoFree,
     next_frame: usize,
     end: Option<usize>,
@@ -36,6 +120,11 @@ pub struct SegmentWriter<'a, 'o, 'm> {
     render_options: &'a RenderOptions<'o, 'm>,
     logger: &'a Arc<dyn FFramesLogger>,
     input: EncoderInput,
+    /// The encoder is dedicated hardware, which can limit its concurrent sessions.
+    hardware_encoder: bool,
+    /// The sessions were probed, see [`Self::probe_encoder_sessions`].
+    probed: AtomicBool,
+    sessions: Arc<Sessions>,
     open: Mutex<HashMap<usize, SegmentSlot>>,
     finished: Mutex<Vec<(usize, PathBuf)>>,
 }
@@ -58,6 +147,9 @@ impl<'a, 'o, 'm> SegmentWriter<'a, 'o, 'm> {
             render_options,
             logger,
             input: EncoderInput::for_options(&render_options.video_encoder_options),
+            hardware_encoder: false,
+            probed: AtomicBool::new(false),
+            sessions: Arc::default(),
             open: Mutex::new(HashMap::new()),
             finished: Mutex::new(Vec::new()),
         }
@@ -67,6 +159,36 @@ impl<'a, 'o, 'm> SegmentWriter<'a, 'o, 'm> {
     pub fn with_encoder_input(mut self, input: EncoderInput) -> Self {
         self.input = input;
         self
+    }
+
+    /// The encoders of the segments run on dedicated hardware (`VideoEncoderInfo::is_hardware`).
+    /// A segment whose encoder is refused waits for the other segments to end and tries again.
+    /// Software encoders are opened as they always were.
+    pub fn with_hardware_encoder(mut self, hardware_encoder: bool) -> Self {
+        self.hardware_encoder = hardware_encoder;
+        self
+    }
+
+    /// How many of `wanted` hardware encoders the device opens at the same time, found by
+    /// opening them (and closing them again). The encoder refused a session when fewer
+    /// opened; a render should run [`concurrent_segments`] segments then.
+    pub fn probe_encoder_sessions(&self, wanted: usize) -> usize {
+        self.probed.store(true, Ordering::Relaxed);
+        let probes: Vec<_> = (0..wanted)
+            .map_while(|index| {
+                let path = self
+                    .directory
+                    .join(format!("probe-{index:010}.{}", self.extension));
+                let encoder = self.open_encoder(&path).ok();
+                encoder.map(|encoder| (encoder, path))
+            })
+            .collect();
+        let opened = probes.len();
+        for (encoder, path) in probes {
+            drop(encoder);
+            let _ = std::fs::remove_file(path);
+        }
+        opened
     }
 
     /// The video encoder the segments will be encoded with, to negotiate its input
@@ -141,20 +263,11 @@ impl<'a, 'o, 'm> SegmentWriter<'a, 'o, 'm> {
 
         let mut guard = slot.lock().unwrap();
         if guard.is_none() {
-            let encoder = unsafe {
-                Encoder::new_with_input(
-                    EncoderOutput::IntermediateChunk,
-                    self.width,
-                    self.height,
-                    self.fps,
-                    &self.segment_path(claim.segment),
-                    self.render_options,
-                    &self.input,
-                    self.logger,
-                )?
-            };
+            let (encoder, session) =
+                self.open_segment_encoder(&self.segment_path(claim.segment))?;
             *guard = Some(Segment {
                 encoder,
+                _session: session,
                 packet: AvPacketAutoFree::new(),
                 next_frame: claim.segment,
                 end: None,
@@ -200,6 +313,35 @@ impl<'a, 'o, 'm> SegmentWriter<'a, 'o, 'm> {
         Ok(())
     }
 
+    fn open_encoder(&self, path: &Path) -> RenderEncodingResult<Encoder> {
+        unsafe {
+            Encoder::new_with_input(
+                EncoderOutput::IntermediateChunk,
+                self.width,
+                self.height,
+                self.fps,
+                path,
+                self.render_options,
+                &self.input,
+                self.logger,
+            )
+        }
+    }
+
+    /// Opens the encoder of a segment, see [`Sessions::open_with_retry`].
+    fn open_segment_encoder(&self, path: &Path) -> RenderEncodingResult<(Encoder, SessionPermit)> {
+        let wait = if !self.hardware_encoder {
+            (Duration::ZERO, Duration::ZERO)
+        } else if self.probed.load(Ordering::Relaxed) {
+            (SESSION_WAIT, PROBE_RELEASE_GRACE)
+        } else {
+            (SESSION_WAIT, Duration::ZERO)
+        };
+        Sessions::open_with_retry(&self.sessions, wait, SESSION_RETRY, || {
+            self.open_encoder(path)
+        })
+    }
+
     fn encode(segment: &mut Segment, index: usize, frame: &VideoFrame) -> RenderEncodingResult<()> {
         unsafe {
             // frame indexes are used as pts, av_packet_rescale_ts converts them into the
@@ -223,5 +365,137 @@ impl<'a, 'o, 'm> SegmentWriter<'a, 'o, 'm> {
         let mut finished = self.finished.into_inner().unwrap();
         finished.sort_by_key(|(segment, _)| *segment);
         Ok(finished.into_iter().map(|(_, path)| path).collect())
+    }
+}
+
+/// How many segments a render runs at once on a device that opened `opened` of the `2 * wanted`
+/// encoders of [`SegmentWriter::probe_encoder_sessions`]. A segment that ends keeps its
+/// encoder open until its last frames are encoded, while the next segment of the same
+/// generator already starts, so a render of `n` segments needs up to `2 * n` sessions. A
+/// device that opened all of them is not limited. One that stopped earlier is, and the render
+/// runs half as many segments as it opened, which keeps every session it needs.
+#[doc(hidden)]
+pub fn concurrent_segments(wanted: usize, opened: usize) -> usize {
+    if opened >= 2 * wanted {
+        wanted
+    } else {
+        (opened / 2).clamp(1, wanted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NO_WAIT: (Duration, Duration) = (Duration::ZERO, Duration::ZERO);
+
+    #[test]
+    fn a_device_that_never_refuses_keeps_all_segments() {
+        assert_eq!(concurrent_segments(16, 32), 16);
+        assert_eq!(concurrent_segments(1, 2), 1);
+    }
+
+    #[test]
+    fn a_device_that_refuses_runs_half_as_many_segments_as_it_opened_sessions() {
+        // NVIDIA's consumer GPUs open 8: 4 segments, each with a successor starting
+        assert_eq!(concurrent_segments(16, 8), 4);
+        assert_eq!(concurrent_segments(16, 31), 15);
+        assert_eq!(concurrent_segments(4, 7), 3);
+        assert_eq!(concurrent_segments(16, 2), 1);
+        // refused at once: the render reports the encoder's error from one segment
+        assert_eq!(concurrent_segments(16, 1), 1);
+        assert_eq!(concurrent_segments(16, 0), 1);
+    }
+
+    #[test]
+    fn a_refused_encoder_is_retried_as_other_sessions_end() {
+        let sessions = Arc::<Sessions>::default();
+        let ((), held) =
+            Sessions::open_with_retry(&sessions, NO_WAIT, Duration::ZERO, || Ok::<_, ()>(()))
+                .unwrap();
+
+        let mut refusals = 0;
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(held);
+        });
+        let opened = Sessions::open_with_retry(
+            &sessions,
+            (Duration::from_secs(10), Duration::ZERO),
+            Duration::from_millis(5),
+            || {
+                // refused while the other session is open
+                if *sessions.open.lock().unwrap() > 0 {
+                    refusals += 1;
+                    Err("refused")
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        releaser.join().unwrap();
+        assert!(opened.is_ok());
+        assert!(refusals > 0, "the first attempts must have been refused");
+    }
+
+    #[test]
+    fn a_refusal_without_other_sessions_or_for_software_fails_at_once() {
+        let sessions = Arc::<Sessions>::default();
+        // nothing else holds a session: nothing to wait for
+        let alone = Sessions::open_with_retry(
+            &sessions,
+            (Duration::from_secs(10), Duration::ZERO),
+            Duration::from_secs(10),
+            || Err::<(), _>("refused"),
+        );
+        assert_eq!(alone.err(), Some("refused"));
+
+        let ((), _held) =
+            Sessions::open_with_retry(&sessions, NO_WAIT, Duration::ZERO, || Ok::<_, &str>(()))
+                .unwrap();
+        // software encoders pass a zero wait, whatever else is open
+        let software =
+            Sessions::open_with_retry(&sessions, NO_WAIT, Duration::from_secs(10), || {
+                Err::<(), _>("failed")
+            });
+        assert_eq!(software.err(), Some("failed"));
+    }
+
+    #[test]
+    fn the_first_segment_after_a_probe_retries_while_the_probe_sessions_are_released() {
+        let sessions = Arc::<Sessions>::default();
+        let mut refusals = 2;
+        let opened = Sessions::open_with_retry(
+            &sessions,
+            (Duration::from_secs(10), Duration::from_secs(5)),
+            Duration::from_millis(1),
+            || {
+                if refusals > 0 {
+                    refusals -= 1;
+                    Err("still held by the probe")
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(opened.is_ok());
+        assert_eq!(refusals, 0);
+    }
+
+    #[test]
+    fn the_wait_is_bounded() {
+        let sessions = Arc::<Sessions>::default();
+        let ((), _held) =
+            Sessions::open_with_retry(&sessions, NO_WAIT, Duration::ZERO, || Ok::<_, &str>(()))
+                .unwrap();
+        let started = Instant::now();
+        let stuck = Sessions::open_with_retry(
+            &sessions,
+            (Duration::from_millis(60), Duration::ZERO),
+            Duration::from_millis(10),
+            || Err::<(), _>("refused"),
+        );
+        assert_eq!(stuck.err(), Some("refused"));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }
