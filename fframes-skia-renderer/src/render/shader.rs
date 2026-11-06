@@ -185,7 +185,11 @@ fn bind_children(
                 _ => None,
             });
 
-        let image_shader = pixels.and_then(|pixels| {
+        // a decoded video frame that stayed on the GPU is bound by its pixels
+        let downloaded = pixels
+            .and_then(fframes::media::resolve_gpu_video_frame)
+            .and_then(|video| video.pixels());
+        let image_shader = downloaded.as_ref().or(pixels).and_then(|pixels| {
             cache.image(pixels).and_then(|image| {
                 image.image().to_shader(
                     (skia_safe::TileMode::Clamp, skia_safe::TileMode::Clamp),
