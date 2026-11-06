@@ -1954,3 +1954,49 @@ mod color_tests {
         }
     }
 }
+
+#[cfg(all(test, feature = "vulkan"))]
+mod gpu_frame_tests {
+    use super::*;
+
+    /// A frame whose `data[0]` is `vk_frame`, as the Vulkan decoder's frames are.
+    fn frame_of(vk_frame: &mut AVVkFrame) -> HostFrame {
+        unsafe {
+            let frame = av_frame_alloc();
+            (*frame).data[0] = ptr::from_mut(vk_frame).cast();
+            HostFrame(frame)
+        }
+    }
+
+    fn decoded() -> AVVkFrame {
+        let mut vk_frame: AVVkFrame = unsafe { std::mem::zeroed() };
+        vk_frame.img[0] = 1;
+        vk_frame.queue_family[0] = u32::MAX;
+        vk_frame
+    }
+
+    #[test]
+    fn only_single_image_frames_usable_by_every_queue_family_stay_on_the_gpu() {
+        let mut vk_frame = decoded();
+        let frame = frame_of(&mut vk_frame);
+        assert!(unsafe { gpu_frame_is_drawable(frame.0) });
+
+        // planes in images of their own
+        let mut separate = decoded();
+        separate.img[1] = 2;
+        let frame = frame_of(&mut separate);
+        assert!(!unsafe { gpu_frame_is_drawable(frame.0) });
+
+        // owned by one queue family (a decode family): downloaded instead
+        let mut owned = decoded();
+        owned.queue_family[0] = 2;
+        let frame = frame_of(&mut owned);
+        assert!(!unsafe { gpu_frame_is_drawable(frame.0) });
+
+        // no image
+        let mut empty = decoded();
+        empty.img[0] = 0;
+        let frame = frame_of(&mut empty);
+        assert!(!unsafe { gpu_frame_is_drawable(frame.0) });
+    }
+}

@@ -306,8 +306,7 @@ impl VulkanVideoFrames {
         Some(self.sets.len() - 1)
     }
 
-    /// Whether `frame` is an NV12 image of this device that every queue can use, with
-    /// `picture` inside it. Returns the `AVVkFrame` and the frames context.
+    /// Whether `frame` can be copied from here. Returns the `AVVkFrame` and the frames context.
     // `data[0]` of a Vulkan frame is the `AVVkFrame` libav allocated.
     #[allow(clippy::cast_ptr_alignment)]
     unsafe fn usable(
@@ -325,20 +324,20 @@ impl VulkanVideoFrames {
             let device = &*(*(*frames).device_ctx)
                 .hwctx
                 .cast::<AVVulkanDeviceContext>();
-            let (width, height) = frame.picture_size();
-            let usable = device.act_dev as usize as u64 == self.device_handle
-                && (*vk_frame).img[0] != 0
-                // one image holding both planes
-                && (*vk_frame).img[1] == 0
-                && frames_hwctx.format[0] == vk::Format::G8_B8R8_2PLANE_420_UNORM.as_raw()
-                && frames_hwctx.usage & vk::ImageUsageFlags::TRANSFER_SRC.as_raw() as i32 != 0
-                // owned by no queue family: usable from the one that draws
-                && (*vk_frame).queue_family[0] == vk::QUEUE_FAMILY_IGNORED
-                && width > 0
-                && height > 0
-                && width as i32 <= (*frames).width
-                && height as i32 <= (*frames).height;
-            usable.then_some((vk_frame, frames))
+            let facts = FrameFacts {
+                same_device: device.act_dev as usize as u64 == self.device_handle,
+                first_image: (*vk_frame).img[0] != 0,
+                second_image: (*vk_frame).img[1] != 0,
+                nv12: frames_hwctx.format[0] == vk::Format::G8_B8R8_2PLANE_420_UNORM.as_raw(),
+                transfer_source: frames_hwctx.usage
+                    & vk::ImageUsageFlags::TRANSFER_SRC.as_raw() as i32
+                    != 0,
+                queue_family: (*vk_frame).queue_family[0],
+                picture: frame.picture_size(),
+                image_size: ((*frames).width, (*frames).height),
+            };
+            facts.check().ok()?;
+            Some((vk_frame, frames))
         }
     }
 
@@ -549,7 +548,7 @@ unsafe fn yuva_image(
         (width as i32, height as i32),
         PlaneConfig::Y_UV,
         Subsampling::S420,
-        yuv_color_space(frame),
+        yuv_color_space(frame.color()),
         None,
         // Skia only knows chroma centered between the luma samples
         Some((Siting::Centered, Siting::Centered)),
@@ -593,8 +592,7 @@ fn plane_texture(
 
 /// The matrix and range of the frame, as the software conversion would use them: streams that
 /// do not say are BT.601, limited range.
-fn yuv_color_space(frame: &GpuVideoFrame) -> YUVColorSpace {
-    let (space, range) = frame.color();
+fn yuv_color_space((space, range): (AVColorSpace, AVColorRange)) -> YUVColorSpace {
     let full = range == AVColorRange::AVCOL_RANGE_JPEG;
     match (space, full) {
         (AVColorSpace::AVCOL_SPC_BT709, true) => YUVColorSpace::Rec709_Full,
@@ -607,5 +605,122 @@ fn yuv_color_space(frame: &GpuVideoFrame) -> YUVColorSpace {
         }
         (_, true) => YUVColorSpace::JPEG,
         (_, false) => YUVColorSpace::Rec601_Limited,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn usable() -> FrameFacts {
+        FrameFacts {
+            same_device: true,
+            first_image: true,
+            second_image: false,
+            nv12: true,
+            transfer_source: true,
+            queue_family: vk::QUEUE_FAMILY_IGNORED,
+            picture: (1920, 1080),
+            image_size: (1920, 1088),
+        }
+    }
+
+    #[test]
+    fn a_decoded_nv12_frame_of_the_device_is_copied() {
+        assert_eq!(usable().check(), Ok(()));
+    }
+
+    #[test]
+    fn every_other_frame_falls_back_to_its_pixels() {
+        let cases = [
+            (
+                FrameFacts {
+                    same_device: false,
+                    ..usable()
+                },
+                Unusable::OtherDevice,
+            ),
+            (
+                FrameFacts {
+                    first_image: false,
+                    ..usable()
+                },
+                Unusable::NoImage,
+            ),
+            (
+                FrameFacts {
+                    second_image: true,
+                    ..usable()
+                },
+                Unusable::SeparateImages,
+            ),
+            (
+                FrameFacts {
+                    nv12: false,
+                    ..usable()
+                },
+                Unusable::NotNv12,
+            ),
+            (
+                FrameFacts {
+                    transfer_source: false,
+                    ..usable()
+                },
+                Unusable::NoTransferSource,
+            ),
+            // owned by a decode queue family, say
+            (
+                FrameFacts {
+                    queue_family: 3,
+                    ..usable()
+                },
+                Unusable::OwnedByQueueFamily,
+            ),
+            (
+                FrameFacts {
+                    picture: (1920, 1090),
+                    ..usable()
+                },
+                Unusable::PictureOutsideImage,
+            ),
+            (
+                FrameFacts {
+                    picture: (0, 1080),
+                    ..usable()
+                },
+                Unusable::PictureOutsideImage,
+            ),
+        ];
+        for (facts, reason) in cases {
+            assert_eq!(facts.check(), Err(reason), "{facts:?}");
+        }
+    }
+
+    #[test]
+    fn colors_follow_the_stream_and_default_to_bt601_limited() {
+        use AVColorRange::{AVCOL_RANGE_JPEG as FULL, AVCOL_RANGE_MPEG as LIMITED};
+        use AVColorSpace::*;
+        let unspecified = AVColorRange::AVCOL_RANGE_UNSPECIFIED;
+        let cases = [
+            ((AVCOL_SPC_BT709, LIMITED), YUVColorSpace::Rec709_Limited),
+            ((AVCOL_SPC_BT709, FULL), YUVColorSpace::Rec709_Full),
+            (
+                (AVCOL_SPC_BT2020_NCL, LIMITED),
+                YUVColorSpace::BT2020_8bit_Limited,
+            ),
+            (
+                (AVCOL_SPC_BT2020_NCL, FULL),
+                YUVColorSpace::BT2020_8bit_Full,
+            ),
+            (
+                (AVCOL_SPC_UNSPECIFIED, unspecified),
+                YUVColorSpace::Rec601_Limited,
+            ),
+            ((AVCOL_SPC_BT470BG, LIMITED), YUVColorSpace::Rec601_Limited),
+            ((AVCOL_SPC_SMPTE170M, FULL), YUVColorSpace::JPEG),
+        ];
+        for (colors, expected) in cases {
+            assert_eq!(yuv_color_space(colors), expected, "{colors:?}");
+        }
     }
 }
