@@ -328,11 +328,27 @@ impl SkiaVulkanCtx {
                 })
                 .collect();
 
+            let physical_device = vk::PhysicalDevice::from_raw(hwctx.phys_dev as usize as u64);
+            // Decoders that keep their frames on the GPU share a part of its memory.
+            let memory = instance.get_physical_device_memory_properties(physical_device);
+            let device_local = memory.memory_heaps[..memory.memory_heap_count as usize]
+                .iter()
+                .filter(|heap| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+                .map(|heap| heap.size)
+                .max()
+                .unwrap_or(0);
+            // a quarter, at most 2 GiB: video frames are one use of the GPU among others
+            fframes::media::set_gpu_frame_budget(
+                usize::try_from(device_local / 4)
+                    .unwrap_or(usize::MAX)
+                    .min(2 << 30),
+            );
+
             Ok(SkiaVulkanCtx {
                 entry,
                 instance,
                 device,
-                physical_device: vk::PhysicalDevice::from_raw(hwctx.phys_dev as usize as u64),
+                physical_device,
                 queue_family_index,
                 queue_locks: queue_locks(&queues),
                 queues,
@@ -570,7 +586,12 @@ impl SkiaBackend for SkiaVulkanCtx {
     }
     #[cfg(feature = "vulkan-video")]
     fn shares_device_with_decoders(&self, input: &fframes::EncoderInput) -> bool {
-        self.encoder_device.is_some() && input.is_hardware()
+        self.encoder_device.is_some()
+            && input.is_hardware()
+            && crate::frame_export::vulkan_video::plane_formats_supported(
+                &self.instance,
+                self.physical_device,
+            )
     }
 
     #[cfg(feature = "vulkan-video")]

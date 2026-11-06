@@ -478,7 +478,8 @@ pub struct FFmpegFrameBuf {
     video_stream_info: VideoStreamInfo,
     converted: Arc<Mutex<ConvertedFrames>>,
     /// Counts the frame against its decoder's limit while it references the GPU pool.
-    _live: Option<LiveFrame>,
+    #[allow(dead_code)] // held for its drop
+    live: Option<LiveFrame>,
 }
 
 impl Drop for FFmpegFrameBuf {
@@ -517,7 +518,7 @@ impl FFmpegFrameBuf {
             Ok(FFmpegFrameBuf {
                 video_stream_info,
                 latest_av_frame: av_frame,
-                _live: None,
+                live: None,
                 resource_name: resource_name.into(),
                 converted: Arc::new(Mutex::new(ConvertedFrames {
                     scaler: sws_ctx,
@@ -627,7 +628,7 @@ impl FFmpegFrameBuf {
                 latest_av_frame: frame,
                 video_stream_info: self.video_stream_info,
                 converted: Arc::clone(&self.converted),
-                _live: self._live.clone(),
+                live: self.live.clone(),
             },
             options.copied(),
             (info.width as u32, info.height as u32),
@@ -696,7 +697,7 @@ impl FFmpegDecoder {
             resource_name: Arc::clone(&frame.resource_name),
             video_stream_info: self.video_stream_info,
             converted: Arc::clone(&frame.converted),
-            _live: self
+            live: self
                 .gpu_frames
                 .as_ref()
                 .filter(|_| on_gpu)
@@ -1559,6 +1560,8 @@ impl Drop for HostFrame {
 /// What a backend needs to draw the frames of a Vulkan stream from the GPU, the same for all
 /// of its frames: NV12 in a pool of images it can copy from.
 #[cfg(feature = "vulkan")]
+// `data` of a frames context is the `AVHWFramesContext` libav allocated.
+#[allow(clippy::cast_ptr_alignment)]
 unsafe fn gpu_stream_is_drawable(frame: *mut AVFrame) -> bool {
     /// `VK_IMAGE_USAGE_TRANSFER_SRC_BIT`
     const TRANSFER_SRC: i32 = 0x1;

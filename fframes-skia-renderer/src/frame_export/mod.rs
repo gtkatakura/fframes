@@ -1,3 +1,4 @@
+use crate::render::gpu_video::GpuVideoSource;
 use crate::{QueueLock, SkiaBackend, SkiaContext, SurfaceReader, lock_queue};
 use fframes::{
     Color, EncoderFrameRenderer, EncoderInput, FFramesRendererError, FFramesRendererResult,
@@ -12,6 +13,8 @@ pub(crate) mod videotoolbox;
 pub(crate) mod vulkan_copy;
 #[cfg(feature = "vulkan-video")]
 pub(crate) mod vulkan_frames;
+#[cfg(feature = "vulkan-video")]
+pub(crate) mod vulkan_video;
 
 /// How the frames Skia renders are handed to the video encoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -47,6 +50,14 @@ pub trait HardwareFrameTarget {
     /// Submits what was drawn since [`Self::begin_frame`] and returns it as a frame of the
     /// encoder.
     fn finish_frame(&mut self, gpu: &mut gpu::DirectContext) -> FFramesRendererResult<VideoFrame>;
+
+    /// Where the context of this target gets decoded video frames that stayed on the GPU
+    /// from (`fframes_media::DecodeMode::GpuFrames`). `None` (the default): the pixels of
+    /// those frames are downloaded and drawn like any image.
+    #[doc(hidden)]
+    fn video_source(&self) -> Option<std::sync::Arc<std::sync::Mutex<dyn GpuVideoSource>>> {
+        None
+    }
 
     /// Ends the target and then the GPU context it was created with, in that order: the
     /// surfaces of the target live on the context. Destroying a context submits to its
@@ -222,9 +233,11 @@ impl<'b> SkiaEncoderFrameRenderer<'b> {
     ) -> FFramesRendererResult<Self> {
         let (width, height) = (width as i32, height as i32);
 
+        let mut video_source = None;
         let (target, gpu, queue) = if input.is_hardware() {
             // hardware frames bring their own surfaces
             let (gpu, target) = backend.hardware_frame_target(input, width, height)?;
+            video_source = target.video_source();
             let queue = ContextQueue {
                 lock: None,
                 reader: None,
@@ -274,7 +287,9 @@ impl<'b> SkiaEncoderFrameRenderer<'b> {
 
         Ok(Self {
             target: Some(target),
-            render_cache: crate::render::RenderCache::new().for_backend(backend),
+            render_cache: crate::render::RenderCache::new()
+                .for_backend(backend)
+                .with_video_frames(video_source),
             converter: None,
             input: input.clone(),
             width,

@@ -10,6 +10,7 @@
 mod convert;
 mod filters;
 mod fingerprint;
+pub(crate) mod gpu_video;
 mod image;
 mod occlusion;
 mod resources;
@@ -163,6 +164,8 @@ pub struct RenderCache {
     /// there are sampled in place, all others are read back.
     #[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
     shared_gpu: Option<u64>,
+    /// Draws the video frames the decoders kept on the GPU, when the context can.
+    video_frames: Option<std::sync::Arc<std::sync::Mutex<dyn gpu_video::GpuVideoSource>>>,
 }
 
 struct FilteredLayer {
@@ -196,10 +199,21 @@ impl RenderCache {
         self
     }
 
+    /// Draws decoded video frames that stayed on the GPU with `source`, which belongs to the
+    /// context of this cache. Without a source their pixels are downloaded.
+    pub(crate) fn with_video_frames(
+        mut self,
+        source: Option<std::sync::Arc<std::sync::Mutex<dyn gpu_video::GpuVideoSource>>>,
+    ) -> Self {
+        self.video_frames = source;
+        self
+    }
+
     /// An empty cache with `config` for the same context as this cache.
     pub fn cleared(&self, config: crate::SkiaCacheConfig) -> Self {
         Self {
             shared_gpu: self.shared_gpu,
+            video_frames: self.video_frames.clone(),
             ..Self::with_config(config)
         }
     }
@@ -1148,12 +1162,29 @@ fn render_raster_image(
     cache: &mut RenderCache,
     alpha: f32,
 ) {
-    // a decoded frame that stayed on the GPU
+    // a decoded frame that stayed on the GPU: drawn from there, or from its pixels
     if let Some(video) = fframes::media::resolve_gpu_video_frame(img) {
-        if let Some(pixels) = video.pixels()
+        let drawn = cache.video_frames.as_ref().and_then(|source| {
+            let mut context = canvas.recording_context()?;
+            source
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .image(&mut context, &video)
+        });
+        if let Some(image) = drawn {
+            // the frame is shown at its display size, which a resize can change
+            draw_raster_image(
+                &image,
+                Some(video.display_size()),
+                view_box,
+                rendering_mode,
+                canvas,
+                alpha,
+            );
+        } else if let Some(pixels) = video.pixels()
             && let Some(image) = cache.image(&pixels).map(SkiaImage::image)
         {
-            draw_raster_image(image, view_box, rendering_mode, canvas, alpha);
+            draw_raster_image(image, None, view_box, rendering_mode, canvas, alpha);
         }
         return;
     }
@@ -1161,11 +1192,11 @@ fn render_raster_image(
     #[cfg(feature = "wgpu")]
     if let Some(layer) = fframes::resolve_wgpu_layer(img) {
         if let Some(image) = wgpu_layer::image(&layer, canvas, cache.shared_gpu) {
-            draw_raster_image(&image, view_box, rendering_mode, canvas, alpha);
+            draw_raster_image(&image, None, view_box, rendering_mode, canvas, alpha);
         } else if let Some(pixels) = layer.pixels()
             && let Some(image) = SkiaImage::new(&pixels)
         {
-            draw_raster_image(image.image(), view_box, rendering_mode, canvas, alpha);
+            draw_raster_image(image.image(), None, view_box, rendering_mode, canvas, alpha);
         }
         return;
     }
@@ -1173,18 +1204,23 @@ fn render_raster_image(
     let Some(sk_image) = cache.image(img).map(SkiaImage::image) else {
         return;
     };
-    draw_raster_image(sk_image, view_box, rendering_mode, canvas, alpha);
+    draw_raster_image(sk_image, None, view_box, rendering_mode, canvas, alpha);
 }
 
-/// Draws `sk_image` into the `view_box` of an `<image>` element.
+/// Draws `sk_image` into the `view_box` of an `<image>` element. `size` is the size the image
+/// is laid out at when that is not its own (a video frame on the GPU is scaled to the size its
+/// pixels would have had).
 fn draw_raster_image(
     sk_image: &skia_safe::Image,
+    size: Option<(u32, u32)>,
     view_box: usvgr::ViewBox,
     rendering_mode: usvgr::ImageRendering,
     canvas: &Canvas,
     alpha: f32,
 ) {
-    let (width, height) = (sk_image.width(), sk_image.height());
+    let (width, height) = size.map_or((sk_image.width(), sk_image.height()), |(width, height)| {
+        (width as i32, height as i32)
+    });
     let Some(img_size) = usvgr::Size::from_wh(width as f32, height as f32) else {
         return;
     };
@@ -1235,9 +1271,10 @@ fn draw_raster_image(
     };
 
     let rect = skia_safe::Rect::from_wh(width as f32, height as f32);
+    let source = skia_safe::Rect::from_wh(sk_image.width() as f32, sk_image.height() as f32);
     canvas.draw_image_rect_with_sampling_options(
         sk_image,
-        Some((&rect, skia_safe::canvas::SrcRectConstraint::Strict)),
+        Some((&source, skia_safe::canvas::SrcRectConstraint::Strict)),
         rect,
         sampling,
         &{

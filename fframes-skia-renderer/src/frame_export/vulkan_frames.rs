@@ -1,6 +1,8 @@
 use super::planes::Channel;
 use super::vulkan_copy::{CopyRing, SharedQueueLock, vulkan_error};
+use super::vulkan_video::{VulkanVideoFrames, plane_formats_supported};
 use crate::HardwareFrameTarget;
+use crate::render::gpu_video::GpuVideoSource;
 use crate::vulkan::SkiaVulkanCtx;
 use ash::vk::{self, Handle};
 use fframes::ffmpeg_sys_fframes::{
@@ -16,6 +18,7 @@ use skia_safe::{
     AlphaType, BlendMode, ColorType, FilterMode, ImageInfo, MipmapMode, Paint, RuntimeEffect,
     SamplingOptions, Surface, TileMode,
 };
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// Copies that may be in flight on the GPU before the rendering thread waits for the oldest.
 const IN_FLIGHT_COPIES: usize = 4;
@@ -178,6 +181,9 @@ pub(crate) struct VulkanFrameTarget {
     queue_lock: SharedQueueLock,
     ring: CopyRing,
     frames: AvBuffer,
+    /// Draws decoded video frames from the GPU, see [`super::vulkan_video`]. `None` on a device
+    /// that can not.
+    video: Option<Arc<Mutex<VulkanVideoFrames>>>,
 }
 
 impl VulkanFrameTarget {
@@ -244,6 +250,26 @@ impl VulkanFrameTarget {
         let queue_family_index = backend.queue_family_index();
         let ring = CopyRing::new(&device, queue_family_index, IN_FLIGHT_COPIES)?;
 
+        let queue_lock = SharedQueueLock {
+            backend_lock: context.queue_lock,
+            encoder_device: encoder_device.clone(),
+            queue_family_index,
+            queue_index: context.queue_index,
+        };
+        let video = plane_formats_supported(backend.instance(), backend.physical_device())
+            .then(|| {
+                VulkanVideoFrames::new(
+                    backend.instance(),
+                    backend.physical_device(),
+                    &device,
+                    context.queue,
+                    queue_lock.clone(),
+                )
+                .ok()
+            })
+            .flatten()
+            .map(|video| Arc::new(Mutex::new(video)));
+
         Ok((
             gpu,
             Self {
@@ -253,14 +279,10 @@ impl VulkanFrameTarget {
                 effect,
                 device,
                 queue: context.queue,
-                queue_lock: SharedQueueLock {
-                    backend_lock: context.queue_lock,
-                    encoder_device: encoder_device.clone(),
-                    queue_family_index,
-                    queue_index: context.queue_index,
-                },
+                queue_lock,
                 ring,
                 frames: frames.clone(),
+                video,
             },
         ))
     }
@@ -425,7 +447,14 @@ impl VulkanFrameTarget {
 
 impl HardwareFrameTarget for VulkanFrameTarget {
     fn begin_frame(&mut self, _gpu: &mut DirectContext) -> FFramesRendererResult<&mut Surface> {
+        // a frame that failed before it was submitted left its video planes held
+        self.end_video_frame();
         Ok(&mut self.scene)
+    }
+
+    fn video_source(&self) -> Option<Arc<Mutex<dyn GpuVideoSource>>> {
+        let video: Arc<Mutex<dyn GpuVideoSource>> = Arc::clone(self.video.as_ref()?) as _;
+        Some(video)
     }
 
     fn retire(self: Box<Self>, gpu: DirectContext) {
@@ -451,7 +480,10 @@ impl HardwareFrameTarget for VulkanFrameTarget {
                 Some(&copy_source),
             );
         }
-        if !self.queue_lock.locked(|| gpu.submit(gpu::SyncCpu::No)) {
+        let submitted = self.queue_lock.locked(|| gpu.submit(gpu::SyncCpu::No));
+        // what the frame drew is submitted: its video planes may be filled again
+        self.end_video_frame();
+        if !submitted {
             return Err(skia_error("can not submit the frame to the GPU"));
         }
 
@@ -465,12 +497,29 @@ impl HardwareFrameTarget for VulkanFrameTarget {
 }
 
 impl VulkanFrameTarget {
+    fn end_video_frame(&self) {
+        if let Some(video) = &self.video {
+            video
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .end_frame();
+        }
+    }
+
     /// See [`HardwareFrameTarget::retire`].
     fn retire_with(mut self: Box<Self>, gpu: DirectContext) {
         self.ring.wait();
         let queue_lock = self.queue_lock.clone();
+        let video = self.video.take();
         drop(self);
         // destroying the context waits for its queue
         queue_lock.locked(|| drop(gpu));
+        // the planes of video frames lived on the context: they go after it
+        if let Some(video) = video {
+            video
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .destroy();
+        }
     }
 }
