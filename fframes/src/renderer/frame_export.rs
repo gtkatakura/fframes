@@ -417,9 +417,25 @@ impl EncoderInput {
 
 /// Opens a libav hardware device (`av_hwdevice_ctx_create`). Fails when `FFmpeg` was built
 /// without it or the machine has no such device.
+///
+/// The Vulkan device is the one of the process, shared with the video decoders (opening
+/// several devices at once crashes some drivers).
 pub fn hardware_device(device_type: AVHWDeviceType) -> RenderEncodingResult<AvBuffer> {
     unsafe {
         let mut device = std::ptr::null_mut();
+        #[cfg(feature = "vulkan")]
+        let status = if device_type == AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN {
+            crate::media::shared_vulkan_device(&mut device)
+        } else {
+            av_hwdevice_ctx_create(
+                &raw mut device,
+                device_type,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        #[cfg(not(feature = "vulkan"))]
         let status = av_hwdevice_ctx_create(
             &raw mut device,
             device_type,

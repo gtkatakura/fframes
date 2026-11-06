@@ -12,6 +12,49 @@ use std::ptr;
 use std::sync::Arc;
 use usvgr::PreloadedImageData;
 
+/// The one Vulkan device of the process. Creating a device per decoder (one per frame-tree
+/// thread) makes the NVIDIA driver crash inside `vkCreateDevice` once many threads do it at
+/// the same time, and every device costs memory. Decoders, the Skia context and the encoder
+/// share this device instead.
+#[cfg(feature = "vulkan")]
+static SHARED_VULKAN_DEVICE: std::sync::Mutex<Option<SendBuffer>> = std::sync::Mutex::new(None);
+
+#[cfg(feature = "vulkan")]
+struct SendBuffer(*mut AVBufferRef);
+// the reference is only used to make new references, which libav allows from any thread
+#[cfg(feature = "vulkan")]
+unsafe impl Send for SendBuffer {}
+
+/// A new reference to the shared Vulkan device (`AV_HWDEVICE_TYPE_VULKAN`), created on first
+/// use. Returns a libav error code and writes the reference to `out`.
+///
+/// # Safety
+/// `out` must be valid for writes. The reference belongs to the caller.
+#[cfg(feature = "vulkan")]
+pub unsafe fn shared_vulkan_device(out: &mut *mut AVBufferRef) -> i32 {
+    unsafe {
+        let mut shared = SHARED_VULKAN_DEVICE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if shared.is_none() {
+            let mut device = ptr::null_mut();
+            let status = av_hwdevice_ctx_create(
+                &raw mut device,
+                AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN,
+                ptr::null(),
+                ptr::null_mut(),
+                0,
+            );
+            if status < 0 {
+                return status;
+            }
+            *shared = Some(SendBuffer(device));
+        }
+        *out = av_buffer_ref(shared.as_ref().expect("just created").0);
+        if out.is_null() { AVERROR(ENOMEM) } else { 0 }
+    }
+}
+
 /// The video stream's duration in its own time base. Matroska and `WebM` leave the stream
 /// duration unset (`AV_NOPTS_VALUE`); their muxers write each track's length as a `DURATION`
 /// tag instead, so use that. Only when the tag is missing too fall back to the container's
@@ -1042,8 +1085,16 @@ unsafe fn find_hw_accelleleration_for_codec(
         ];
 
         for &hw_type in &hw_types {
+            #[cfg(feature = "vulkan")]
+            let create_result = if hw_type == AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN {
+                shared_vulkan_device(hw_device_ctx)
+            } else {
+                av_hwdevice_ctx_create(hw_device_ctx, hw_type, ptr::null(), ptr::null_mut(), 0)
+            };
+            #[cfg(not(feature = "vulkan"))]
             let create_result =
                 av_hwdevice_ctx_create(hw_device_ctx, hw_type, ptr::null(), ptr::null_mut(), 0);
+
 
             if create_result < 0 {
                 continue;

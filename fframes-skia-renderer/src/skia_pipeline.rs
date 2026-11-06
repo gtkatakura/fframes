@@ -107,6 +107,14 @@ impl BufferPool {
     }
 }
 
+/// Every segment opens an encoder of its own. NVIDIA's drivers refuse more than 8 concurrent
+/// encode sessions of a consumer GPU (`AuthorizeEncoderSession` fails the 9th, measured on an
+/// RTX 5080 with `h264_vulkan`), so a hardware encoder never gets more segments than that.
+#[cfg(feature = "vulkan-video")]
+const HARDWARE_ENCODER_SESSIONS: usize = 8;
+#[cfg(not(feature = "vulkan-video"))]
+const HARDWARE_ENCODER_SESSIONS: usize = usize::MAX;
+
 /// Renders a video through three pools of threads connected by bounded queues:
 ///
 /// ```text
@@ -180,7 +188,7 @@ pub(crate) fn render<'p, 'a, 'media: 'a, TVideo: Video + Sync + Send, TBackend: 
     // `SOFTWARE_ENCODERS_MEMORY` caps the count (4K stays at half of the threads).
     let generators = (workers / 2).max(1);
     let generators = if hardware_encoder {
-        generators
+        generators.min(HARDWARE_ENCODER_SESSIONS)
     } else {
         let frame_bytes = ctx.current_video_size.width
             * ctx.current_video_size.height
