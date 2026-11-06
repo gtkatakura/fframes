@@ -26,10 +26,14 @@ thread_local! {
 mod audio_decoder;
 #[cfg(not(target_arch = "wasm32"))]
 mod video_decoder;
+#[cfg(all(feature = "vulkan", not(target_arch = "wasm32")))]
+mod vulkan_device;
 #[cfg(not(target_arch = "wasm32"))]
 pub use ffmpeg_sys_fframes;
 #[cfg(not(target_arch = "wasm32"))]
 pub use video_decoder::*;
+#[cfg(all(feature = "vulkan", not(target_arch = "wasm32")))]
+pub use vulkan_device::shared_vulkan_device;
 // For fframes shaders and wgpu layers, not public API.
 #[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]

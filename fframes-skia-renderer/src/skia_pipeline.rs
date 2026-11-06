@@ -200,6 +200,7 @@ pub(crate) fn render<'p, 'a, 'media: 'a, TVideo: Video + Sync + Send, TBackend: 
             .video_encoder_options
             .min_segment_frames(ctx.time_base.fps),
     );
+    let gpu_video_frames = skia.shares_device_with_decoders(&encoder_input);
     let writer = writer.with_encoder_input(encoder_input);
 
     #[cfg(feature = "debug")]
@@ -246,6 +247,7 @@ pub(crate) fn render<'p, 'a, 'media: 'a, TVideo: Video + Sync + Send, TBackend: 
                         font_db,
                         tree_sender,
                         queue_size,
+                        gpu_video_frames,
                         pipeline_config.cache.text_capacity,
                         ctx,
                         failed,
@@ -353,6 +355,7 @@ fn generate_frames<'a, 'media: 'a, TVideo: Video + Sync + Send>(
     font_db: &'a usvgr::fontdb::Database,
     tree_sender: SyncSender<(FrameClaim, usvgr::Tree)>,
     queue_size: usize,
+    gpu_video_frames: bool,
     text_cache_capacity: usize,
     ctx: &'a FFramesContext<'a, 'media>,
     failed: &AtomicBool,
@@ -362,6 +365,11 @@ fn generate_frames<'a, 'media: 'a, TVideo: Video + Sync + Send>(
     let mut converter_cache = usvgr::Cache::new_with_text_cache(text_cache_capacity);
     // x2 because sometimes we might need to decode 2 frames at once
     let video_decoders_worker = VideoDecodersWorker::new(queue_size * 2);
+    let video_decoders_worker = if gpu_video_frames {
+        video_decoders_worker.with_gpu_frames()
+    } else {
+        video_decoders_worker
+    };
 
     while let Some(claim) = scheduler.claim(worker) {
         #[cfg(feature = "debug")]

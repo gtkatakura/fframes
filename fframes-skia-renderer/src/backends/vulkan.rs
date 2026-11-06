@@ -277,14 +277,11 @@ impl SkiaVulkanCtx {
     /// Fails when `FFmpeg` can not open a Vulkan device (Vulkan 1.3 is required).
     #[cfg(feature = "vulkan-video")]
     pub fn new_shared_with_encoder(width: usize, height: usize) -> FFramesRendererResult<Self> {
-        use fframes::ffmpeg_sys_fframes::{
-            AVHWDeviceContext, AVHWDeviceType, AVVulkanDeviceContext,
-        };
+        use fframes::ffmpeg_sys_fframes::{AVHWDeviceContext, AVVulkanDeviceContext};
 
-        let encoder_device = fframes::hardware_device(AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN)
-            .map_err(|err| {
-                FFramesRendererError::Skia(format!("FFmpeg can not open a Vulkan device: {err}"))
-            })?;
+        let encoder_device = fframes::shared_vulkan_device().map_err(|err| {
+            FFramesRendererError::Skia(format!("FFmpeg can not open a Vulkan device: {err}"))
+        })?;
 
         unsafe {
             let hwctx = &*(*encoder_device.data::<AVHWDeviceContext>())
@@ -571,6 +568,11 @@ impl SkiaBackend for SkiaVulkanCtx {
             reader: Some(Box::new(reader)),
         })
     }
+    #[cfg(feature = "vulkan-video")]
+    fn shares_device_with_decoders(&self, input: &fframes::EncoderInput) -> bool {
+        self.encoder_device.is_some() && input.is_hardware()
+    }
+
     #[cfg(feature = "vulkan-video")]
     fn negotiate_hardware_frames(
         &self,

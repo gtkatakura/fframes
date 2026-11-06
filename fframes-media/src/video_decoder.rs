@@ -376,6 +376,11 @@ pub enum DecodeMode {
     Preview,
     /// Use the codec's software implementation.
     Software,
+    /// Like `Configured`, for a render that draws the frames on the GPU of the Vulkan device
+    /// it shares with its decoders and encoder (feature `vulkan`, see
+    /// [`shared_vulkan_device`](crate::shared_vulkan_device)): Vulkan decoders open that
+    /// device instead of one of their own. Without the feature this is `Configured`.
+    GpuFrames,
 }
 
 #[derive(Debug)]
@@ -751,7 +756,7 @@ impl FFmpegDecoder {
                 has_decoded_frame: false,
                 recent: VecDeque::new(),
                 // Export workers own their decoders and read in order.
-                recent_capacity: if mode == DecodeMode::Configured {
+                recent_capacity: if matches!(mode, DecodeMode::Configured | DecodeMode::GpuFrames) {
                     0
                 } else {
                     RECENT_FRAMES
@@ -1308,8 +1313,7 @@ unsafe fn find_hw_acceleration_for_codec(
 
             // The codec context owns the reference returned on success.
             if hw_pix_fmt != AVPixelFormat::AV_PIX_FMT_NONE
-                && av_hwdevice_ctx_create(hw_device_ctx, hw_type, ptr::null(), ptr::null_mut(), 0)
-                    >= 0
+                && create_hw_device(hw_device_ctx, hw_type, mode) >= 0
             {
                 return Some(hw_pix_fmt);
             }
@@ -1317,6 +1321,21 @@ unsafe fn find_hw_acceleration_for_codec(
     }
 
     None
+}
+
+/// Opens the libav device of `hw_type`. A render that shares its Vulkan device
+/// ([`DecodeMode::GpuFrames`]) gets the shared one.
+unsafe fn create_hw_device(
+    hw_device_ctx: &mut *mut AVBufferRef,
+    hw_type: AVHWDeviceType,
+    mode: DecodeMode,
+) -> i32 {
+    #[cfg(feature = "vulkan")]
+    if mode == DecodeMode::GpuFrames && hw_type == AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN {
+        return unsafe { crate::shared_vulkan_device(hw_device_ctx) };
+    }
+    let _ = mode;
+    unsafe { av_hwdevice_ctx_create(hw_device_ctx, hw_type, ptr::null(), ptr::null_mut(), 0) }
 }
 
 /// Callback called from the C world that negotiating the available pixel format

@@ -361,6 +361,15 @@ impl VideoDecodersWorker {
         }
     }
 
+    /// Decoders of a render that draws on the GPU of the Vulkan device shared with them
+    /// ([`shared_vulkan_device`](crate::shared_vulkan_device)). Only the Skia backend with the
+    /// `vulkan-video` feature turns this on, for the frames it can draw from the GPU.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_gpu_frames(mut self) -> Self {
+        self.mode = fframes_media::DecodeMode::GpuFrames;
+        self
+    }
+
     /// The native studio keeps only recently used source decoders between frames.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn for_preview(software_decode: bool) -> Self {

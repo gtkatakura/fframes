@@ -479,6 +479,25 @@ pub fn hardware_device(device_type: AVHWDeviceType) -> RenderEncodingResult<AvBu
     }
 }
 
+/// The Vulkan device of the process, shared by the video decoders of a render that draws
+/// their frames on the GPU ([`VideoDecodersWorker::with_gpu_frames`](crate::VideoDecodersWorker::with_gpu_frames)),
+/// the rendering backend and the encoder (feature `vulkan`). Opens it on first use and
+/// keeps it for the life of the process: libav devices opened by several threads at the
+/// same time crash some drivers (NVIDIA's `vkCreateDevice`).
+#[cfg(feature = "vulkan")]
+pub fn shared_vulkan_device() -> RenderEncodingResult<AvBuffer> {
+    unsafe {
+        let mut device = std::ptr::null_mut();
+        let status = crate::media::shared_vulkan_device(&raw mut device);
+        if status < 0 {
+            return Err(ffmpeg_error(status));
+        }
+
+        AvBuffer::from_raw(device)
+            .ok_or_else(|| RenderEncodingError::CantAllocate("hardware device".to_owned()))
+    }
+}
+
 /// Where the planes of a software frame are inside its pixel buffer.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FrameLayout {

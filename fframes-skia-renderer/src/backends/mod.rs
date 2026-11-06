@@ -62,6 +62,13 @@ pub trait SkiaBackend: Sync + Send {
         None
     }
 
+    /// Whether the decoders of a render with this encoder input share the GPU device of
+    /// this backend, so they can hand it decoded frames without leaving the GPU. Only
+    /// backends that draw such frames say yes.
+    fn shares_device_with_decoders(&self, _input: &EncoderInput) -> bool {
+        false
+    }
+
     fn create_skia_surface(&self) -> FFramesRendererResult<(Surface, Option<DirectContext>)>;
 
     /// Like [`Self::create_skia_surface`], with what the context needs to share its GPU
