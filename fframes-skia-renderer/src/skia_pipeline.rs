@@ -107,11 +107,13 @@ impl BufferPool {
     }
 }
 
-/// Every segment opens an encoder of its own. NVIDIA's drivers refuse more than 8 concurrent
-/// encode sessions of a consumer GPU (`AuthorizeEncoderSession` fails the 9th, measured on an
-/// RTX 5080 with `h264_vulkan`), so a hardware encoder never gets more segments than that.
+/// Every segment opens an encoder of its own, and a finished segment's encoder is still open
+/// for a moment when the next one starts. NVIDIA's drivers refuse more than 8 concurrent encode
+/// sessions of a consumer GPU (`AuthorizeEncoderSession` fails the 9th; measured on an RTX 5080
+/// with `h264_vulkan`: 8 segments failed 2 of 20 renders, 7 and 6 failed none), so a hardware
+/// encoder gets a few segments less than that.
 #[cfg(feature = "vulkan-video")]
-const HARDWARE_ENCODER_SESSIONS: usize = 8;
+const HARDWARE_ENCODER_SESSIONS: usize = 6;
 #[cfg(not(feature = "vulkan-video"))]
 const HARDWARE_ENCODER_SESSIONS: usize = usize::MAX;
 
