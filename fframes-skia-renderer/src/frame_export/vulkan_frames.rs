@@ -1,10 +1,10 @@
 use super::planes::Channel;
+use super::vulkan_copy::{CopyRing, SharedQueueLock, vulkan_error};
 use crate::HardwareFrameTarget;
 use crate::vulkan::SkiaVulkanCtx;
 use ash::vk::{self, Handle};
 use fframes::ffmpeg_sys_fframes::{
-    AVHWDeviceContext, AVHWFramesContext, AVPixelFormat, AVVkFrame, AVVulkanDeviceContext,
-    AVVulkanFramesContext,
+    AVHWFramesContext, AVPixelFormat, AVVkFrame, AVVulkanFramesContext,
 };
 use fframes::{
     AvBuffer, EncoderInput, FFramesRendererError, FFramesRendererResult, VideoEncoderInfo,
@@ -42,10 +42,6 @@ half4 main(float2 coord) {
 
 fn skia_error(message: &str) -> FFramesRendererError {
     FFramesRendererError::Skia(message.to_owned())
-}
-
-fn vulkan_error(what: &str, result: vk::Result) -> FFramesRendererError {
-    FFramesRendererError::Skia(format!("{what}: {result}"))
 }
 
 /// Offers NV12 Vulkan frames to encoders that take them, when the device is shared.
@@ -171,45 +167,6 @@ impl Plane {
     }
 }
 
-/// The lock of the queue a GPU context submits to. `FFmpeg` uses the queues of the shared
-/// device too and guards them with these locks, so everything Skia or we submit to the
-/// queue has to hold it.
-#[derive(Clone)]
-struct SharedQueueLock {
-    /// The lock other Skia contexts on the same queue take.
-    backend_lock: crate::QueueLock,
-    encoder_device: AvBuffer,
-    queue_family_index: u32,
-    queue_index: u32,
-}
-
-impl SharedQueueLock {
-    /// Runs `submit` while no other thread submits to the queue.
-    fn locked<T>(&self, submit: impl FnOnce() -> T) -> T {
-        let _backend = crate::lock_queue(Some(&self.backend_lock));
-        unsafe {
-            let device = self.encoder_device.data::<AVHWDeviceContext>();
-            let hwctx = &*(*device).hwctx.cast::<AVVulkanDeviceContext>();
-
-            if let Some(lock) = hwctx.lock_queue {
-                lock(device, self.queue_family_index, self.queue_index);
-            }
-            let result = submit();
-            if let Some(unlock) = hwctx.unlock_queue {
-                unlock(device, self.queue_family_index, self.queue_index);
-            }
-            result
-        }
-    }
-}
-
-/// A command buffer for one copy and the fence that tells when the GPU is done with it.
-struct CopySlot {
-    commands: vk::CommandBuffer,
-    fence: vk::Fence,
-    in_flight: bool,
-}
-
 /// Renders frames into the Vulkan images of the encoder's frame pool, see the module docs.
 pub(crate) struct VulkanFrameTarget {
     scene: Surface,
@@ -219,9 +176,7 @@ pub(crate) struct VulkanFrameTarget {
     device: ash::Device,
     queue: vk::Queue,
     queue_lock: SharedQueueLock,
-    command_pool: vk::CommandPool,
-    slots: Vec<CopySlot>,
-    next_slot: usize,
+    ring: CopyRing,
     frames: AvBuffer,
 }
 
@@ -287,44 +242,7 @@ impl VulkanFrameTarget {
 
         let device = backend.device().clone();
         let queue_family_index = backend.queue_family_index();
-        let (command_pool, slots) = unsafe {
-            let command_pool = device
-                .create_command_pool(
-                    &vk::CommandPoolCreateInfo::default()
-                        .queue_family_index(queue_family_index)
-                        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
-                    None,
-                )
-                .map_err(|err| vulkan_error("can not create a command pool", err))?;
-
-            let mut slots = Vec::with_capacity(IN_FLIGHT_COPIES);
-            let allocated = device
-                .allocate_command_buffers(
-                    &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(command_pool)
-                        .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(IN_FLIGHT_COPIES as u32),
-                )
-                .and_then(|buffers| {
-                    for commands in buffers {
-                        slots.push(CopySlot {
-                            commands,
-                            fence: device.create_fence(&vk::FenceCreateInfo::default(), None)?,
-                            in_flight: false,
-                        });
-                    }
-                    Ok(())
-                });
-
-            if let Err(err) = allocated {
-                for slot in &slots {
-                    device.destroy_fence(slot.fence, None);
-                }
-                device.destroy_command_pool(command_pool, None);
-                return Err(vulkan_error("can not allocate command buffers", err));
-            }
-            (command_pool, slots)
-        };
+        let ring = CopyRing::new(&device, queue_family_index, IN_FLIGHT_COPIES)?;
 
         Ok((
             gpu,
@@ -341,23 +259,10 @@ impl VulkanFrameTarget {
                     queue_family_index,
                     queue_index: context.queue_index,
                 },
-                command_pool,
-                slots,
-                next_slot: 0,
+                ring,
                 frames: frames.clone(),
             },
         ))
-    }
-
-    /// Waits until the copies that are still running on the GPU are done.
-    fn wait_for_copies(&mut self) {
-        for slot in &mut self.slots {
-            if std::mem::take(&mut slot.in_flight) {
-                unsafe {
-                    let _ = self.device.wait_for_fences(&[slot.fence], true, u64::MAX);
-                }
-            }
-        }
     }
 
     /// Copies the converted planes into the images of `frame` and hands the images over to
@@ -373,22 +278,8 @@ impl VulkanFrameTarget {
                 return Err(skia_error("the hardware frame has no Vulkan image"));
             }
 
-            let slot_index = self.next_slot;
-            self.next_slot = (self.next_slot + 1) % self.slots.len();
-            let slot = &mut self.slots[slot_index];
-            if std::mem::take(&mut slot.in_flight) {
-                self.device
-                    .wait_for_fences(&[slot.fence], true, u64::MAX)
-                    .map_err(|err| vulkan_error("waiting for a frame copy failed", err))?;
-            }
-            self.device
-                .reset_fences(&[slot.fence])
-                .and_then(|()| {
-                    self.device
-                        .reset_command_buffer(slot.commands, vk::CommandBufferResetFlags::empty())
-                })
-                .map_err(|err| vulkan_error("can not reuse a command buffer", err))?;
-            let (commands, fence) = (slot.commands, slot.fence);
+            let copy = self.ring.take()?;
+            let (commands, fence) = (copy.commands, copy.fence);
 
             if let Some(lock) = frames_hwctx.lock_frame {
                 lock(frames_context, vk_frame);
@@ -399,7 +290,7 @@ impl VulkanFrameTarget {
             }
             result?;
 
-            self.slots[slot_index].in_flight = true;
+            self.ring.submitted(&copy);
             Ok(())
         }
     }
@@ -576,22 +467,10 @@ impl HardwareFrameTarget for VulkanFrameTarget {
 impl VulkanFrameTarget {
     /// See [`HardwareFrameTarget::retire`].
     fn retire_with(mut self: Box<Self>, gpu: DirectContext) {
-        self.wait_for_copies();
+        self.ring.wait();
         let queue_lock = self.queue_lock.clone();
         drop(self);
         // destroying the context waits for its queue
         queue_lock.locked(|| drop(gpu));
-    }
-}
-
-impl Drop for VulkanFrameTarget {
-    fn drop(&mut self) {
-        self.wait_for_copies();
-        unsafe {
-            for slot in &self.slots {
-                self.device.destroy_fence(slot.fence, None);
-            }
-            self.device.destroy_command_pool(self.command_pool, None);
-        }
     }
 }

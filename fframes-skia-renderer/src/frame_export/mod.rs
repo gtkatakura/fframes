@@ -9,6 +9,8 @@ mod planes;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) mod videotoolbox;
 #[cfg(feature = "vulkan-video")]
+pub(crate) mod vulkan_copy;
+#[cfg(feature = "vulkan-video")]
 pub(crate) mod vulkan_frames;
 
 /// How the frames Skia renders are handed to the video encoder.
