@@ -62,6 +62,14 @@ pub trait SkiaBackend: Sync + Send {
         None
     }
 
+    /// Whether the contexts of this backend can sample the images of decoded Vulkan frames
+    /// (`fframes_media::GpuVideoFrame`) in place, and release them to the decoder after a
+    /// frame, when the frames are hardware frames ([`HardwareFrameTarget`]). The pipeline
+    /// then lets the video decoders keep their frames on the GPU.
+    fn draws_gpu_video_frames(&self) -> bool {
+        false
+    }
+
     fn create_skia_surface(&self) -> FFramesRendererResult<(Surface, Option<DirectContext>)>;
 
     /// Like [`Self::create_skia_surface`], with what the context needs to share its GPU

@@ -115,6 +115,27 @@ const HARDWARE_ENCODER_SESSIONS: usize = 8;
 #[cfg(not(feature = "vulkan-video"))]
 const HARDWARE_ENCODER_SESSIONS: usize = usize::MAX;
 
+/// Lets the video decoders keep their frames on the GPU while it lives.
+#[cfg(feature = "vulkan-video")]
+struct GpuVideoFrames(bool);
+
+#[cfg(feature = "vulkan-video")]
+impl GpuVideoFrames {
+    fn enable(on: bool) -> Self {
+        fframes::media::set_gpu_video_frames(on);
+        Self(on)
+    }
+}
+
+#[cfg(feature = "vulkan-video")]
+impl Drop for GpuVideoFrames {
+    fn drop(&mut self) {
+        if self.0 {
+            fframes::media::set_gpu_video_frames(false);
+        }
+    }
+}
+
 /// Renders a video through three pools of threads connected by bounded queues:
 ///
 /// ```text
@@ -178,6 +199,11 @@ pub(crate) fn render<'p, 'a, 'media: 'a, TVideo: Video + Sync + Send, TBackend: 
                 .map(|input| (input, encoder.is_hardware()))
         })
         .map_err(|err| FFramesRendererError::RenderChunkError(0, err))?;
+
+    // Decoded video frames stay on the GPU when the frames are drawn there and read by the
+    // encoder; the flag is for the decoders the generators create below.
+    #[cfg(feature = "vulkan-video")]
+    let _gpu_video = GpuVideoFrames::enable(encoder_input.is_hardware() && skia.draws_gpu_video_frames());
 
     // Generators own the segments, so their count also caps how many segments encode at
     // once. Half of the threads keeps the GPU fed and is enough for hardware encoders. A

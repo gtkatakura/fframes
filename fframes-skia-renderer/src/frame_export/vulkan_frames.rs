@@ -532,8 +532,34 @@ impl VulkanFrameTarget {
     }
 }
 
+impl VulkanFrameTarget {
+    /// One empty submission to the queue of the frame: it waits for and signals timeline
+    /// semaphores. Waits order every later submission to the queue, signals every earlier one.
+    fn submit_semaphores(
+        &self,
+        waits: &[(u64, u64)],
+        signals: &[(u64, u64)],
+    ) -> Result<(), vk::Result> {
+        let info = |&(semaphore, value): &(u64, u64)| {
+            vk::SemaphoreSubmitInfo::default()
+                .semaphore(vk::Semaphore::from_raw(semaphore))
+                .value(value)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+        };
+        let waits: Vec<_> = waits.iter().map(info).collect();
+        let signals: Vec<_> = signals.iter().map(info).collect();
+        let submit = vk::SubmitInfo2::default()
+            .wait_semaphore_infos(&waits)
+            .signal_semaphore_infos(&signals);
+        self.queue_lock
+            .locked(|| unsafe { self.device.queue_submit2(self.queue, &[submit], vk::Fence::null()) })
+    }
+}
+
 impl HardwareFrameTarget for VulkanFrameTarget {
     fn begin_frame(&mut self, _gpu: &mut DirectContext) -> FFramesRendererResult<&mut Surface> {
+        // a frame that failed before it was submitted may have left video frames locked
+        crate::render::gpu_video::discard();
         Ok(&mut self.scene)
     }
 
@@ -542,6 +568,13 @@ impl HardwareFrameTarget for VulkanFrameTarget {
     }
 
     fn finish_frame(&mut self, gpu: &mut DirectContext) -> FFramesRendererResult<VideoFrame> {
+        // Decoded video frames drawn into this frame: Skia's submission waits for the decoder.
+        let video_waits = crate::render::gpu_video::waits();
+        if !video_waits.is_empty() {
+            self.submit_semaphores(&video_waits, &[])
+                .map_err(|err| vulkan_error("can not wait for the video decoder", err))?;
+        }
+
         let frame = self.scene.image_snapshot();
         self.luma.draw(&self.effect, &frame)?;
         self.chroma.draw(&self.effect, &frame)?;
@@ -560,7 +593,10 @@ impl HardwareFrameTarget for VulkanFrameTarget {
                 Some(&copy_source),
             );
         }
-        if !self.queue_lock.locked(|| gpu.submit(gpu::SyncCpu::No)) {
+        let submitted = self.queue_lock.locked(|| gpu.submit(gpu::SyncCpu::No));
+        // The signal covers everything submitted to the queue before it, Skia's draws too.
+        crate::render::gpu_video::release(|signals| self.submit_semaphores(&[], signals).is_ok());
+        if !submitted {
             return Err(skia_error("can not submit the frame to the GPU"));
         }
 

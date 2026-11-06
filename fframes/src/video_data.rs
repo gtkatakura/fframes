@@ -132,9 +132,38 @@ impl<'media> FFramesSyncedVideoFrame<'media> for WasmEditorVideoFrameFallback<'m
     }
 }
 
+/// Video frames that stayed on the GPU, see [`resolve_gpu_video_frame`].
+#[cfg(all(not(target_arch = "wasm32"), feature = "vulkan"))]
+static GPU_VIDEO_FRAMES: crate::markers::Markers<fframes_media::GpuVideoFrame> =
+    crate::markers::Markers::new("fframes-gpu-video:");
+
+/// The decoded frame behind `image`, if the decoder kept it on the GPU
+/// (`fframes_media::set_gpu_video_frames`). Rendering backends call this for every raster
+/// image; a backend that does not draw such frames never turns the mode on.
+#[cfg(all(not(target_arch = "wasm32"), feature = "vulkan"))]
+pub fn resolve_gpu_video_frame(
+    image: &Arc<usvgr::PreloadedImageData>,
+) -> Option<Arc<fframes_media::GpuVideoFrame>> {
+    GPU_VIDEO_FRAMES.resolve(image)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "vulkan"))]
+fn gpu_video_image<'media>(
+    frame: &crate::media::FFmpegFrameBuf,
+    size: Option<(u32, u32)>,
+) -> Option<ImageData<'media>> {
+    let gpu_frame = frame.gpu_frame()?;
+    let (width, height) = size.unwrap_or((frame.get_stream_width(), frame.get_stream_height()));
+    Some(GPU_VIDEO_FRAMES.create(gpu_frame, width, height))
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 impl<'media> FFramesSyncedVideoFrame<'media> for crate::media::FFmpegFrameBuf {
     fn into_image(&self) -> ImageData<'media> {
+        #[cfg(feature = "vulkan")]
+        if let Some(image) = gpu_video_image(self, None) {
+            return image;
+        }
         let image_data = unsafe { self.convert_last_decoded_frame_into_svg_image(None) }
             // we unwrap here because we guarantee that the sws scaler would work correctly
             // unless the wrong dimensions are provided
@@ -152,6 +181,13 @@ impl<'media> FFramesSyncedVideoFrame<'media> for crate::media::FFmpegFrameBuf {
     }
 
     fn into_resized_image(&self, options: &FrameConvertOptions) -> Option<ImageData<'media>> {
+        // the GPU scales the frame when it draws it
+        #[cfg(feature = "vulkan")]
+        if let Some(image) =
+            gpu_video_image(self, Some((options.resize.width, options.resize.height)))
+        {
+            return Some(image);
+        }
         let image_data = unsafe { self.convert_last_decoded_frame_into_svg_image(Some(options)) }
             .map_err(|e| {
                 eprintln!("Error converting frame to image: {e:?}");

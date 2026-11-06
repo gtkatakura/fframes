@@ -55,6 +55,41 @@ pub unsafe fn shared_vulkan_device(out: &mut *mut AVBufferRef) -> i32 {
     }
 }
 
+/// Whether decoders keep Vulkan frames on the GPU (see [`GpuVideoFrame`]) instead of
+/// transferring them to the CPU. A rendering backend that draws them sets it.
+static GPU_VIDEO_FRAMES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Decoders created from now on keep decoded Vulkan frames on the GPU. Only a backend that
+/// can draw [`GpuVideoFrame`]s may turn it on, and it has to turn it off when it is done.
+pub fn set_gpu_video_frames(on: bool) {
+    GPU_VIDEO_FRAMES.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// A decoded frame that never left the GPU: a reference to an `AV_PIX_FMT_VULKAN` frame. The
+/// backend that draws it must honor the timeline semaphore and the layout in its `AVVkFrame`
+/// (`data[0]`), and update them after its last use, like every user of a libav Vulkan frame.
+pub struct GpuVideoFrame {
+    frame: *mut AVFrame,
+    /// Colors of the frame, the stream's where the frame says nothing.
+    pub color_space: AVColorSpace,
+    pub color_range: AVColorRange,
+}
+
+unsafe impl Send for GpuVideoFrame {}
+unsafe impl Sync for GpuVideoFrame {}
+
+impl GpuVideoFrame {
+    pub fn as_ptr(&self) -> *mut AVFrame {
+        self.frame
+    }
+}
+
+impl Drop for GpuVideoFrame {
+    fn drop(&mut self) {
+        unsafe { av_frame_free(&raw mut self.frame) }
+    }
+}
+
 /// The video stream's duration in its own time base. Matroska and `WebM` leave the stream
 /// duration unset (`AV_NOPTS_VALUE`); their muxers write each track's length as a `DURATION`
 /// tag instead, so use that. Only when the tag is missing too fall back to the container's
@@ -392,6 +427,8 @@ pub struct FFmpegDecoder {
     draining: bool,
     /// The target frame holds a frame decoded since the last seek.
     has_decoded_frame: bool,
+    /// Decoded Vulkan frames stay on the GPU, see [`GpuVideoFrame`].
+    gpu_frames: bool,
 }
 
 unsafe impl Send for FFmpegDecoder {}
@@ -611,6 +648,33 @@ impl FFmpegFrameBuf {
         }
     }
 
+    /// The latest decoded frame if it is still on the GPU (the decoder keeps Vulkan frames
+    /// there when a backend draws them, see [`set_gpu_video_frames`]).
+    pub fn gpu_frame(&self) -> Option<GpuVideoFrame> {
+        unsafe {
+            let latest = self.latest_av_frame;
+            if latest.is_null() || (*latest).format != AVPixelFormat::AV_PIX_FMT_VULKAN as i32 {
+                return None;
+            }
+            let frame = av_frame_clone(latest);
+            if frame.is_null() {
+                return None;
+            }
+            let info = &self.video_stream_info;
+            Some(GpuVideoFrame {
+                frame,
+                color_space: match (*frame).colorspace {
+                    AVColorSpace::AVCOL_SPC_UNSPECIFIED => info.color_space,
+                    color_space => color_space,
+                },
+                color_range: match (*frame).color_range {
+                    AVColorRange::AVCOL_RANGE_UNSPECIFIED => info.color_range,
+                    color_range => color_range,
+                },
+            })
+        }
+    }
+
     /// Returns the timestamp of the frame in the native frame timebase
     /// # Safety
     /// This is a libav based function which involves C ffi cals
@@ -706,7 +770,13 @@ impl FFmpegDecoder {
                 )));
             }
 
-            let video_stream_info = Self::open_codec_context(fmt_ctx)?;
+            let gpu_frames = GPU_VIDEO_FRAMES.load(std::sync::atomic::Ordering::SeqCst);
+            // Frames that stay on the GPU are held by the frames being rendered, so the pool
+            // needs room for them beside the decoder's own references.
+            let extra_hw_frames = if gpu_frames { buffer_size as i32 + 4 } else { 0 };
+            let video_stream_info = Self::open_codec_context(fmt_ctx, extra_hw_frames)?;
+            let gpu_frames = gpu_frames
+                && video_stream_info.hw_pix_fmt == Some(AVPixelFormat::AV_PIX_FMT_VULKAN);
             let pkt = av_packet_alloc();
             if pkt.is_null() {
                 avformat_close_input(&raw mut fmt_ctx);
@@ -763,11 +833,15 @@ impl FFmpegDecoder {
                 last_offset: None,
                 draining: false,
                 has_decoded_frame: false,
+                gpu_frames,
             })
         }
     }
 
-    unsafe fn open_codec_context(fmt_ctx: *mut AVFormatContext) -> Result<VideoStreamInfo> {
+    unsafe fn open_codec_context(
+        fmt_ctx: *mut AVFormatContext,
+        extra_hw_frames: i32,
+    ) -> Result<VideoStreamInfo> {
         unsafe {
             let ret = av_find_best_stream(
                 fmt_ctx,
@@ -807,6 +881,7 @@ impl FFmpegDecoder {
                 (*video_dec_ctx).opaque = hw_pix_fmt as i32 as *mut c_void;
                 (*video_dec_ctx).get_format = Some(get_hw_format);
                 (*video_dec_ctx).hw_device_ctx = av_buffer_ref(hw_device_ctx);
+                (*video_dec_ctx).extra_hw_frames = extra_hw_frames;
             }
 
             if avcodec_parameters_to_context(video_dec_ctx, (*stream).codecpar) < 0 {
@@ -897,11 +972,28 @@ impl FFmpegDecoder {
         Ok(new_offset)
     }
 
+    /// Whether `frame` stays on the GPU: frames of the shared Vulkan device that a backend
+    /// draws. The libav frame has to be usable by any queue family (`queue_family` ignored),
+    /// otherwise it is transferred as usual.
+    unsafe fn keeps_on_gpu(&mut self, frame: *mut AVFrame) -> bool {
+        if self.gpu_frames && (*frame).format == AVPixelFormat::AV_PIX_FMT_VULKAN as i32 {
+            let vk_frame = (*frame).data[0].cast::<AVVkFrame>();
+            if !vk_frame.is_null() && (*vk_frame).queue_family[0] == u32::MAX {
+                return true;
+            }
+            self.gpu_frames = false;
+        }
+        false
+    }
+
     /// If we are actually using hardware accelerated frames it is required to correctly
     /// move the data from the hardware surface to the software frame
-    unsafe fn transfer_hardware_surface_data(&self, target_frame: *mut AVFrame) -> Result<()> {
-        match self.video_stream_info.hw_pix_fmt {
-            Some(hw_pix_fmt) if hw_pix_fmt as i32 == (*target_frame).format => {
+    unsafe fn transfer_hardware_surface_data(&mut self, target_frame: *mut AVFrame) -> Result<()> {
+        let hw_pix_fmt = self.video_stream_info.hw_pix_fmt;
+        match hw_pix_fmt {
+            Some(hw_pix_fmt)
+                if hw_pix_fmt as i32 == (*target_frame).format && !self.keeps_on_gpu(target_frame) =>
+            {
                 if (*self.frame_buf.latest_av_frame).format
                     == (AVPixelFormat::AV_PIX_FMT_NONE as i32)
                 {
@@ -1094,7 +1186,6 @@ unsafe fn find_hw_accelleleration_for_codec(
             #[cfg(not(feature = "vulkan"))]
             let create_result =
                 av_hwdevice_ctx_create(hw_device_ctx, hw_type, ptr::null(), ptr::null_mut(), 0);
-
 
             if create_result < 0 {
                 continue;

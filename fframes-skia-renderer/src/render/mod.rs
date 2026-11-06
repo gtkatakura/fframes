@@ -10,6 +10,8 @@
 mod convert;
 mod filters;
 mod fingerprint;
+#[cfg(feature = "vulkan-video")]
+pub(crate) mod gpu_video;
 mod image;
 mod occlusion;
 mod resources;
@@ -1148,14 +1150,23 @@ fn render_raster_image(
     cache: &mut RenderCache,
     alpha: f32,
 ) {
+    // a decoded frame that stayed on the GPU is sampled where it is
+    #[cfg(feature = "vulkan-video")]
+    if let Some(frame) = fframes::resolve_gpu_video_frame(img) {
+        if let Some((image, picture)) = gpu_video::image(&frame, canvas) {
+            draw_raster_image(&image, Some(picture), view_box, rendering_mode, canvas, alpha);
+        }
+        return;
+    }
+
     #[cfg(feature = "wgpu")]
     if let Some(layer) = fframes::resolve_wgpu_layer(img) {
         if let Some(image) = wgpu_layer::image(&layer, canvas, cache.shared_gpu) {
-            draw_raster_image(&image, view_box, rendering_mode, canvas, alpha);
+            draw_raster_image(&image, None, view_box, rendering_mode, canvas, alpha);
         } else if let Some(pixels) = layer.pixels()
             && let Some(image) = SkiaImage::new(&pixels)
         {
-            draw_raster_image(image.image(), view_box, rendering_mode, canvas, alpha);
+            draw_raster_image(image.image(), None, view_box, rendering_mode, canvas, alpha);
         }
         return;
     }
@@ -1163,18 +1174,20 @@ fn render_raster_image(
     let Some(sk_image) = cache.image(img).map(SkiaImage::image) else {
         return;
     };
-    draw_raster_image(sk_image, view_box, rendering_mode, canvas, alpha);
+    draw_raster_image(sk_image, None, view_box, rendering_mode, canvas, alpha);
 }
 
 /// Draws `sk_image` into the `view_box` of an `<image>` element.
 fn draw_raster_image(
     sk_image: &skia_safe::Image,
+    // the part of the image that is the picture (a decoder's images are padded to its blocks)
+    picture: Option<(i32, i32)>,
     view_box: usvgr::ViewBox,
     rendering_mode: usvgr::ImageRendering,
     canvas: &Canvas,
     alpha: f32,
 ) {
-    let (width, height) = (sk_image.width(), sk_image.height());
+    let (width, height) = picture.unwrap_or((sk_image.width(), sk_image.height()));
     let Some(img_size) = usvgr::Size::from_wh(width as f32, height as f32) else {
         return;
     };

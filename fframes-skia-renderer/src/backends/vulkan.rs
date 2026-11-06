@@ -39,6 +39,10 @@ pub struct SkiaVulkanCtx {
 }
 
 struct ForeignDevice {
+    /// The features libav enabled (`VkPhysicalDeviceFeatures2` and its chain), which live as
+    /// long as the libav device.
+    #[cfg(feature = "vulkan-video")]
+    features: *const c_void,
     api_version: gpu::vk::Version,
     instance_extensions: Vec<String>,
     device_extensions: Vec<String>,
@@ -324,6 +328,7 @@ impl SkiaVulkanCtx {
                 width,
                 height,
                 foreign_device: Some(ForeignDevice {
+                    features: std::ptr::addr_of!(hwctx.device_features).cast(),
                     // what libav creates its instance with
                     api_version: gpu::vk::Version::new(1, 3, 0),
                     instance_extensions: extension_names(
@@ -424,6 +429,13 @@ impl SkiaVulkanCtx {
                     backend_context.with_extensions(&instance_extensions, &device_extensions);
             }
             let backend_context = backend_context.build();
+            // skia-bindings leaves `VulkanBackendContext::fDeviceFeatures2` null, and Skia then
+            // assumes the device has no optional features (no sampler YCbCr conversion, which
+            // decoded video frames need). Point it at the features libav enabled.
+            #[cfg(feature = "vulkan-video")]
+            if let Some(device) = &self.foreign_device {
+                set_device_features(&backend_context, self.queues[queue_index], device.features);
+            }
 
             // Configure context options (same as in Metal implementation)
             let mut gpu_context_opts = gpu::ContextOptions::new();
@@ -484,6 +496,13 @@ impl SkiaBackend for SkiaVulkanCtx {
     #[cfg(feature = "wgpu")]
     fn shared_gpu_id(&self) -> Option<u64> {
         self.shared_gpu.as_ref().map(fframes::SharedGpu::id)
+    }
+
+    #[cfg(feature = "vulkan-video")]
+    fn draws_gpu_video_frames(&self) -> bool {
+        self.foreign_device
+            .as_ref()
+            .is_some_and(|device| unsafe { has_ycbcr_conversion(device.features) })
     }
 
     fn create_skia_surface(&self) -> FFramesRendererResult<(Surface, Option<DirectContext>)> {
@@ -679,6 +698,47 @@ impl<'a> SkiaFFramesRenderer<'a, SkiaVulkanCtx> {
         pipeline_config: SkiaPipelineConfig,
     ) -> FFramesRendererResult<Self> {
         Ok(Self::new(pipeline_config, ctx))
+    }
+}
+
+/// Sets `fDeviceFeatures2` of a Skia `VulkanBackendContext`, which `skia-safe` has no setter
+/// for. Offsets are those of include/gpu/vk/VulkanBackendContext.h (Skia m153): `fInstance` at
+/// 0, `fQueue` at 24, `fDeviceFeatures2` at 56. The layout is checked, and the features are
+/// left unset (Skia assumes none) when it is not the expected one.
+#[cfg(feature = "vulkan-video")]
+fn set_device_features(
+    backend: &gpu::vk::BackendContext,
+    queue: vk::Queue,
+    features: *const c_void,
+) {
+    unsafe {
+        let native = *std::ptr::from_ref(backend).cast::<*mut u8>();
+        if native.is_null() || *native.add(24).cast::<u64>() != queue.as_raw() {
+            eprintln!("fframes: unexpected Skia VulkanBackendContext layout, device features not set");
+            return;
+        }
+        *native.add(56).cast::<*const c_void>() = features;
+    }
+}
+
+/// Whether the features chain of libav's device enables sampler YCbCr conversion.
+#[cfg(feature = "vulkan-video")]
+unsafe fn has_ycbcr_conversion(features: *const c_void) -> bool {
+    unsafe {
+        let mut next = features.cast::<vk::BaseOutStructure>();
+        while !next.is_null() {
+            if (*next).s_type == vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_1_FEATURES {
+                return (*next.cast::<vk::PhysicalDeviceVulkan11Features>()).sampler_ycbcr_conversion
+                    == vk::TRUE;
+            }
+            if (*next).s_type == vk::StructureType::PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES {
+                return (*next.cast::<vk::PhysicalDeviceSamplerYcbcrConversionFeatures>())
+                    .sampler_ycbcr_conversion
+                    == vk::TRUE;
+            }
+            next = (*next).p_next;
+        }
+        false
     }
 }
 
