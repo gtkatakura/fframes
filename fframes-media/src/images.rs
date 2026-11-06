@@ -189,8 +189,9 @@ pub fn rendered_image(width: u32, height: u32, rgba: Vec<u8>) -> ImageData<'stat
     )
 }
 
-/// The pixels of `image`. An image on the GPU (`fframes::wgpu_layer`) is read back, which
-/// waits for the GPU. `None` when that fails. Other images are their own pixels.
+/// The pixels of `image`. An image on the GPU (`fframes::wgpu_layer`, a video frame the
+/// decoder kept there) is read back, which waits for the GPU. `None` when that fails. Other
+/// images are their own pixels.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn image_pixels(
     image: &Arc<usvgr::PreloadedImageData>,
@@ -198,6 +199,9 @@ pub fn image_pixels(
     #[cfg(feature = "wgpu")]
     if let Some(layer) = crate::wgpu_layer::resolve_wgpu_layer(image) {
         return layer.pixels();
+    }
+    if let Some(frame) = crate::resolve_gpu_video_frame(image) {
+        return frame.pixels();
     }
     Some(Arc::clone(image))
 }

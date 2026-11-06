@@ -164,9 +164,23 @@ fn decoded_image<'media>(pixels: Arc<usvgr::PreloadedImageData>) -> ImageData<'m
     ImageData::new_from_raw_data(pixels, id, metadata)
 }
 
+/// The image of a frame the decoder kept on the GPU, see
+/// [`fframes_media::DecodeMode::GpuFrames`]. `None` for every frame in memory.
+#[cfg(all(not(target_arch = "wasm32"), feature = "vulkan"))]
+fn gpu_video_image<'media>(
+    frame: &crate::media::FFmpegFrameBuf,
+    options: Option<&FrameConvertOptions>,
+) -> Option<ImageData<'media>> {
+    frame.gpu_frame(options).map(fframes_media::gpu_video_image)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 impl<'media> FFramesSyncedVideoFrame<'media> for crate::media::FFmpegFrameBuf {
     fn into_image(&self) -> ImageData<'media> {
+        #[cfg(feature = "vulkan")]
+        if let Some(image) = gpu_video_image(self, None) {
+            return image;
+        }
         let image_data = unsafe { self.convert_last_decoded_frame_into_svg_image(None) }
             .expect("Failed to convert frame to image");
 
@@ -174,6 +188,11 @@ impl<'media> FFramesSyncedVideoFrame<'media> for crate::media::FFmpegFrameBuf {
     }
 
     fn into_resized_image(&self, options: &FrameConvertOptions) -> Option<ImageData<'media>> {
+        // the GPU scales the frame when it draws it
+        #[cfg(feature = "vulkan")]
+        if let Some(image) = gpu_video_image(self, Some(options)) {
+            return Some(image);
+        }
         let image_data = unsafe { self.convert_last_decoded_frame_into_svg_image(Some(options)) }
             .map_err(|e| {
                 eprintln!("Error converting frame to image: {e:?}");

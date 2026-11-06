@@ -1148,6 +1148,16 @@ fn render_raster_image(
     cache: &mut RenderCache,
     alpha: f32,
 ) {
+    // a decoded frame that stayed on the GPU
+    if let Some(video) = fframes::media::resolve_gpu_video_frame(img) {
+        if let Some(pixels) = video.pixels()
+            && let Some(image) = cache.image(&pixels).map(SkiaImage::image)
+        {
+            draw_raster_image(image, view_box, rendering_mode, canvas, alpha);
+        }
+        return;
+    }
+
     #[cfg(feature = "wgpu")]
     if let Some(layer) = fframes::resolve_wgpu_layer(img) {
         if let Some(image) = wgpu_layer::image(&layer, canvas, cache.shared_gpu) {

@@ -25,11 +25,17 @@ thread_local! {
 #[cfg(not(target_arch = "wasm32"))]
 mod audio_decoder;
 #[cfg(not(target_arch = "wasm32"))]
+mod gpu_frames;
+#[cfg(not(target_arch = "wasm32"))]
 mod video_decoder;
 #[cfg(all(feature = "vulkan", not(target_arch = "wasm32")))]
 mod vulkan_device;
 #[cfg(not(target_arch = "wasm32"))]
 pub use ffmpeg_sys_fframes;
+#[cfg(not(target_arch = "wasm32"))]
+pub use gpu_frames::{
+    GpuVideoFrame, gpu_video_image, resolve_gpu_video_frame, set_gpu_frame_budget,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use video_decoder::*;
 #[cfg(all(feature = "vulkan", not(target_arch = "wasm32")))]

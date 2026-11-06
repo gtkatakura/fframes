@@ -1,5 +1,6 @@
 use crate::FFramesMediaError;
 use crate::error::Result;
+use crate::gpu_frames::{GpuFrames, GpuVideoFrame, LiveFrame};
 use crate::video_types::{FrameConvertOptions, PlaybackSpeed};
 use ffmpeg_sys_fframes::SwsFlags::{SWS_BICUBIC, SWS_BILINEAR};
 use ffmpeg_sys_fframes::*;
@@ -410,7 +411,15 @@ pub struct FFmpegDecoder {
     recent: VecDeque<*mut AVFrame>,
     recent_capacity: usize,
     seeks: u64,
+    /// The frames this decoder keeps on the GPU, see [`DecodeMode::GpuFrames`]. `None`: every
+    /// frame is downloaded.
+    gpu_frames: Option<GpuFrames>,
+    /// Whether the stream's frames can be kept on the GPU, known after the first frame.
+    gpu_stream_ok: Option<bool>,
 }
+
+/// Frames beyond the converted ring that a render holds on the GPU: the ones being drawn.
+const EXTRA_GPU_FRAMES: usize = 4;
 
 /// Frames the preview keeps for out-of-order requests, see `FFmpegDecoder::recent`.
 const RECENT_FRAMES: usize = 8;
@@ -468,6 +477,8 @@ pub struct FFmpegFrameBuf {
     latest_av_frame: *mut AVFrame,
     video_stream_info: VideoStreamInfo,
     converted: Arc<Mutex<ConvertedFrames>>,
+    /// Counts the frame against its decoder's limit while it references the GPU pool.
+    _live: Option<LiveFrame>,
 }
 
 impl Drop for FFmpegFrameBuf {
@@ -506,6 +517,7 @@ impl FFmpegFrameBuf {
             Ok(FFmpegFrameBuf {
                 video_stream_info,
                 latest_av_frame: av_frame,
+                _live: None,
                 resource_name: resource_name.into(),
                 converted: Arc::new(Mutex::new(ConvertedFrames {
                     scaler: sws_ctx,
@@ -551,7 +563,10 @@ impl FFmpegFrameBuf {
 
         let mut pixels = converted.free_pixels();
         let scaler = &mut converted.scaler;
-        unsafe { scaler.convert(options, self.latest_av_frame, &mut pixels)? };
+        // A frame that stayed on the GPU is downloaded first.
+        let downloaded = unsafe { download_gpu_frame(self.latest_av_frame)? };
+        let source = downloaded.as_ref().map_or(self.latest_av_frame, |f| f.0);
+        unsafe { scaler.convert(options, source, &mut pixels)? };
         if scaler.source_has_alpha {
             premultiply_alpha(&mut pixels);
         }
@@ -567,6 +582,58 @@ impl FFmpegFrameBuf {
             image: Arc::clone(&image),
         });
         Ok(image)
+    }
+
+    pub(crate) fn latest_frame_ptr(&self) -> *mut AVFrame {
+        self.latest_av_frame
+    }
+
+    /// The latest frame as a [`GpuVideoFrame`] when it is a Vulkan frame the decoder kept on
+    /// the GPU, `None` when it is in memory. `options` are the conversion the pixels would
+    /// get ([`GpuVideoFrame::pixels`]).
+    pub fn gpu_frame(&self, options: Option<&FrameConvertOptions>) -> Option<GpuVideoFrame> {
+        let info = &self.video_stream_info;
+        let frame = unsafe {
+            if self.latest_av_frame.is_null()
+                || (*self.latest_av_frame).format != AVPixelFormat::AV_PIX_FMT_VULKAN as i32
+            {
+                return None;
+            }
+            let frame = av_frame_clone(self.latest_av_frame);
+            if frame.is_null() {
+                return None;
+            }
+            frame
+        };
+        let colors = unsafe {
+            (
+                match (*frame).colorspace {
+                    AVColorSpace::AVCOL_SPC_UNSPECIFIED => info.color_space,
+                    color_space => color_space,
+                },
+                match (*frame).color_range {
+                    AVColorRange::AVCOL_RANGE_UNSPECIFIED => info.color_range,
+                    color_range => color_range,
+                },
+            )
+        };
+        let display = options.map_or(
+            (info.display_width as u32, info.display_height as u32),
+            |options| (options.resize.width, options.resize.height),
+        );
+        Some(GpuVideoFrame::new(
+            FFmpegFrameBuf {
+                resource_name: Arc::clone(&self.resource_name),
+                latest_av_frame: frame,
+                video_stream_info: self.video_stream_info,
+                converted: Arc::clone(&self.converted),
+                _live: self._live.clone(),
+            },
+            options.copied(),
+            (info.width as u32, info.height as u32),
+            display,
+            colors,
+        ))
     }
 
     /// Returns the timestamp of the frame in the native frame timebase
@@ -622,11 +689,18 @@ impl FFmpegDecoder {
         if latest_av_frame.is_null() {
             return Err(FFramesMediaError::LibAVAllocationError("frame"));
         }
+        let on_gpu =
+            unsafe { (*latest_av_frame).format } == AVPixelFormat::AV_PIX_FMT_VULKAN as i32;
         Ok(Arc::new(FFmpegFrameBuf {
             latest_av_frame,
             resource_name: Arc::clone(&frame.resource_name),
             video_stream_info: self.video_stream_info,
             converted: Arc::clone(&frame.converted),
+            _live: self
+                .gpu_frames
+                .as_ref()
+                .filter(|_| on_gpu)
+                .map(GpuFrames::live_frame),
         }))
     }
 
@@ -722,8 +796,12 @@ impl FFmpegDecoder {
                 )));
             }
 
-            let (mut codec_ctx, video_stream_info) = Self::open_codec_context(fmt_ctx, mode)
-                .inspect_err(|_| avformat_close_input(&raw mut fmt_ctx))?;
+            // The frames a render holds at once: the converted ring, and the ones in the
+            // frame queues and being drawn.
+            let wanted_gpu_frames = buffer_size + EXTRA_GPU_FRAMES;
+            let (mut codec_ctx, video_stream_info, gpu_frames) =
+                Self::open_codec_context(fmt_ctx, mode, wanted_gpu_frames)
+                    .inspect_err(|_| avformat_close_input(&raw mut fmt_ctx))?;
             let frame_buf = FFmpegFrameBuf::new(
                 filename.to_string_lossy().into_owned(),
                 video_stream_info,
@@ -762,6 +840,8 @@ impl FFmpegDecoder {
                     RECENT_FRAMES
                 },
                 seeks: 0,
+                gpu_frames,
+                gpu_stream_ok: None,
             };
 
             decoder.pkt = av_packet_alloc();
@@ -785,7 +865,8 @@ impl FFmpegDecoder {
     unsafe fn open_codec_context(
         fmt_ctx: *mut AVFormatContext,
         mode: DecodeMode,
-    ) -> Result<(*mut AVCodecContext, VideoStreamInfo)> {
+        wanted_gpu_frames: usize,
+    ) -> Result<(*mut AVCodecContext, VideoStreamInfo, Option<GpuFrames>)> {
         unsafe {
             let ret = av_find_best_stream(
                 fmt_ctx,
@@ -829,12 +910,34 @@ impl FFmpegDecoder {
 
             let hw_pix_fmt =
                 find_hw_acceleration_for_codec(&mut (*video_dec_ctx).hw_device_ctx, dec, mode);
+            let mut gpu_frames = None;
             if let Some(hw_pix_fmt) = hw_pix_fmt {
                 (*video_dec_ctx).opaque = hw_pix_fmt as i32 as *mut c_void;
                 (*video_dec_ctx).get_format = Some(get_hw_format);
+                if mode == DecodeMode::GpuFrames && hw_pix_fmt == AVPixelFormat::AV_PIX_FMT_VULKAN {
+                    // The frames of the render stay in the pool, so it needs room for them
+                    // beside the decoder's own references.
+                    let (width, height) =
+                        ((*(*stream).codecpar).width, (*(*stream).codecpar).height);
+                    let aligned = |size: i32| (size.max(0) as usize).next_multiple_of(64);
+                    let frame_bytes = aligned(width) * aligned(height) * 3 / 2;
+                    if let Some((reservation, frames)) =
+                        crate::gpu_frames::reserve(frame_bytes, wanted_gpu_frames)
+                    {
+                        (*video_dec_ctx).extra_hw_frames = frames as i32;
+                        gpu_frames = Some(GpuFrames::new(reservation, frames));
+                    }
+                }
             }
 
             let ret = avcodec_open2(video_dec_ctx, dec, ptr::null_mut());
+            if ret < 0 && gpu_frames.is_some() {
+                // The GPU has no room for the pool of frames to keep: open the decoder
+                // without them, its frames are downloaded.
+                avcodec_free_context(&raw mut video_dec_ctx);
+                drop(gpu_frames);
+                return Self::open_codec_context(fmt_ctx, mode, 0);
+            }
             if ret < 0 {
                 avcodec_free_context(&raw mut video_dec_ctx);
                 return Err(FFramesMediaError::LibAVAudioDecodingError((
@@ -880,6 +983,7 @@ impl FFmpegDecoder {
                     duration: stream_duration(fmt_ctx, stream),
                     frame_rate: (*stream).r_frame_rate,
                 },
+                gpu_frames,
             ))
         }
     }
@@ -995,6 +1099,27 @@ impl FFmpegDecoder {
         }
     }
 
+    /// Whether `frame` (a frame of the hardware pool) stays on the GPU: the decoder keeps
+    /// frames there ([`DecodeMode::GpuFrames`]), has room for one more, and the frame is
+    /// one a rendering backend can draw from the GPU, see [`gpu_frame_is_drawable`].
+    unsafe fn keeps_on_gpu(&mut self, frame: *mut AVFrame) -> bool {
+        let Some(gpu_frames) = &self.gpu_frames else {
+            return false;
+        };
+        if !gpu_frames.has_room() {
+            return false;
+        }
+        unsafe {
+            let info = self.video_stream_info;
+            // what the stream says does not change from frame to frame
+            let stream_ok = *self.gpu_stream_ok.get_or_insert_with(|| {
+                (info.display_width, info.display_height) == (info.width, info.height)
+                    && gpu_stream_is_drawable(frame)
+            });
+            stream_ok && gpu_frame_is_drawable(frame)
+        }
+    }
+
     /// If we are actually using hardware accelerated frames it is required to correctly
     /// move the data from the hardware surface to the software frame
     unsafe fn transfer_hardware_surface_data(&mut self, target_frame: *mut AVFrame) -> Result<()> {
@@ -1002,6 +1127,18 @@ impl FFmpegDecoder {
             Some(hw_pix_fmt) if hw_pix_fmt as i32 == (*target_frame).format => {
                 // A retained frame can still own the last transfer's software planes.
                 let output = self.frame_buf.latest_av_frame;
+                if self.keeps_on_gpu(target_frame) {
+                    // The frame stays in the pool: the output holds a reference to it.
+                    av_frame_unref(output);
+                    let ret = av_frame_ref(output, target_frame);
+                    if ret < 0 {
+                        return Err(FFramesMediaError::LibAVAudioDecodingError((
+                            ret,
+                            "Error retaining the hardware frame".to_string(),
+                        )));
+                    }
+                    return Ok(());
+                }
                 if self.map_videotoolbox && hw_pix_fmt == AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX {
                     // FFmpeg holds a read lock on the CVPixelBuffer until the last
                     // mapped frame reference drops. swscale can read its planes directly.
@@ -1015,6 +1152,7 @@ impl FFmpegDecoder {
                 // copy_props appends side data and merges dictionaries. Retire those
                 // along with the pixels if this destination already has frame metadata.
                 if (!(*output).buf[0].is_null() && av_frame_is_writable(output) == 0)
+                    || (*output).format == hw_pix_fmt as i32
                     || (*output).nb_side_data != 0
                     || !(*output).metadata.is_null()
                 {
@@ -1285,6 +1423,12 @@ unsafe fn find_hw_acceleration_for_codec(
             AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN,
         ];
 
+        let mut hw_types = hw_types;
+        if mode == DecodeMode::GpuFrames {
+            // the device the render draws on decodes the frames it draws
+            hw_types.sort_by_key(|&hw_type| hw_type != AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN);
+        }
+
         for &hw_type in &hw_types {
             #[cfg(all(feature = "preview-videotoolbox", not(feature = "videotoolbox")))]
             if hw_type == AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX
@@ -1369,6 +1513,92 @@ unsafe extern "C" fn get_hw_format(
 
         AVPixelFormat::AV_PIX_FMT_NONE
     }
+}
+
+/// A host copy of a Vulkan frame (`None` for any other frame, which already is one), made
+/// like the decoder's own transfers. The caller converts it and drops it.
+unsafe fn download_gpu_frame(frame: *mut AVFrame) -> Result<Option<HostFrame>> {
+    unsafe {
+        if (*frame).format != AVPixelFormat::AV_PIX_FMT_VULKAN as i32 {
+            return Ok(None);
+        }
+        let host = av_frame_alloc();
+        if host.is_null() {
+            return Err(FFramesMediaError::LibAVAllocationError("frame"));
+        }
+        let host = HostFrame(host);
+        if let Some(format) = find_hw_out_source_format(frame) {
+            (*host.0).format = format as i32;
+        }
+        let ret = av_hwframe_transfer_data(host.0, frame, 0);
+        if ret < 0 {
+            return Err(FFramesMediaError::LibAVAudioDecodingError((
+                ret,
+                "Error transferring data from GPU surface".to_string(),
+            )));
+        }
+        let ret = av_frame_copy_props(host.0, frame);
+        if ret < 0 {
+            return Err(FFramesMediaError::LibAVAudioDecodingError((
+                ret,
+                "Error copying hardware frame properties".to_string(),
+            )));
+        }
+        Ok(Some(host))
+    }
+}
+
+struct HostFrame(*mut AVFrame);
+
+impl Drop for HostFrame {
+    fn drop(&mut self) {
+        unsafe { av_frame_free(&raw mut self.0) }
+    }
+}
+
+/// What a backend needs to draw the frames of a Vulkan stream from the GPU, the same for all
+/// of its frames: NV12 in a pool of images it can copy from.
+#[cfg(feature = "vulkan")]
+unsafe fn gpu_stream_is_drawable(frame: *mut AVFrame) -> bool {
+    /// `VK_IMAGE_USAGE_TRANSFER_SRC_BIT`
+    const TRANSFER_SRC: i32 = 0x1;
+    unsafe {
+        if (*frame).hw_frames_ctx.is_null() {
+            return false;
+        }
+        let frames = (*(*frame).hw_frames_ctx).data.cast::<AVHWFramesContext>();
+        let frames_hwctx = &*(*frames).hwctx.cast::<AVVulkanFramesContext>();
+        (*frames).sw_format == AVPixelFormat::AV_PIX_FMT_NV12
+            && frames_hwctx.usage & TRANSFER_SRC != 0
+    }
+}
+
+#[cfg(not(feature = "vulkan"))]
+unsafe fn gpu_stream_is_drawable(_frame: *mut AVFrame) -> bool {
+    false
+}
+
+/// Whether this frame can be drawn from the GPU by any queue: one image holding both planes,
+/// usable by every queue family. libav marks images `CONCURRENT` (queue family
+/// `VK_QUEUE_FAMILY_IGNORED`) whenever its device uses more than one queue family, which is
+/// the case wherever decoding has a queue family of its own. An image owned by a single
+/// family would need a queue family ownership transfer first; those frames are downloaded.
+#[cfg(feature = "vulkan")]
+// `data[0]` of a Vulkan frame is the `AVVkFrame` libav allocated.
+#[allow(clippy::cast_ptr_alignment)]
+unsafe fn gpu_frame_is_drawable(frame: *mut AVFrame) -> bool {
+    unsafe {
+        let vk_frame = (*frame).data[0].cast::<AVVkFrame>();
+        !vk_frame.is_null()
+            && (*vk_frame).img[0] != 0
+            && (*vk_frame).img[1] == 0
+            && (*vk_frame).queue_family[0] == u32::MAX
+    }
+}
+
+#[cfg(not(feature = "vulkan"))]
+unsafe fn gpu_frame_is_drawable(_frame: *mut AVFrame) -> bool {
+    false
 }
 
 unsafe fn find_hw_out_source_format(frame: *mut AVFrame) -> Option<AVPixelFormat> {
