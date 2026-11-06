@@ -308,6 +308,11 @@ frames (`*_videotoolbox` encoders with `new_metal`; `h264_vulkan`/`hevc_vulkan` 
 `SkiaVulkanCtx::new_shared_with_encoder` and the `vulkan-video` feature), else conversion to
 the encoder's YUV format on the GPU, else on the CPU. `.frame_export(SkiaFrameExport::CpuConversion)`
 on the renderer turns that off.
+With `h264_vulkan`/`hevc_vulkan` hardware frames, video sources (`get_synced_video_frame`,
+`Clip`) stay on the GPU as well when the driver decodes them with Vulkan Video: no download, no
+CPU conversion. Frames that cannot (10 bit, another pixel shape, no GPU memory) are converted on the
+CPU as always. Chroma is filtered a little differently from the CPU path (about 43 dB PSNR on real
+footage, less at hard colored edges); `.gpu_video_frames(false)` on the renderer turns it off.
 
 ## The project's command line
 

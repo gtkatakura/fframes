@@ -94,6 +94,8 @@
 //!   `libav-agree-version3`, which state that you accept the corresponding `FFmpeg` license terms.
 //! - Hardware acceleration `videotoolbox`, `audiotoolbox`, `vaapi`, `nvidia`, `qsv`, `vulkan`,
 //!   `mediacodec`: enable the platform encoders and decoders in `FFmpeg`.
+//!   With `vulkan` and the Skia Vulkan backend (`vulkan-video`), decoded video frames stay on the
+//!   GPU, see [`media::GpuVideoFrame`].
 //!
 //! # `FFmpeg`
 //!

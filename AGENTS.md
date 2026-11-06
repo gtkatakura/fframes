@@ -820,6 +820,42 @@ a scene name.
   3. RGBA readback and conversion on the CPU for every other pixel format
      (`SkiaFrameExport::CpuConversion` forces it). The CPU backend always converts this way.
 
+  With hardware frames on `h264_vulkan`/`hevc_vulkan`, video sources stay on the GPU too. The
+  decoders of the render open the one Vulkan device of the process
+  (`fframes::shared_vulkan_device`, also what `new_shared_with_encoder` renders on) and keep
+  their frames in libav's pool instead of downloading them and converting them with swscale
+  (`DecodeMode::GpuFrames`). The frame in the tree is an image that stands for an
+  `fframes::media::GpuVideoFrame`, and the Skia Vulkan backend copies its two NV12 planes on
+  the GPU into `R8` and `R8G8` images and draws them as a YUVA image (`frame_export::vulkan_video`;
+  Skia's YCbCr sampler is not used, `skia-safe` has no way to enable it). Everything else is
+  unchanged: the CPU backend, Metal, the native player, the editor and every render that is not
+  hardware-frame Vulkan decode and draw frames as before. Rules:
+  - Any frame that does not qualify is converted on the CPU as always: not NV12 in one
+    image (8 bit 4:2:0 only), images owned by one queue family instead of every one (libav
+    makes them usable by all whenever its device uses more than one family, so decode on a
+    family of its own is covered; an ownership transfer is not implemented), non-square
+    pixels, another device, no GPU memory for the pool or the planes, or a decoder that is
+    out of room. `GpuVideoFrame::pixels()` (also `fframes::image_pixels`) is that
+    conversion; custom renderers and shaders that bind the image get it through them.
+  - GPU memory is bounded: the frames of all decoders share a budget a quarter of the device's
+    local memory (at most 2 GiB; `fframes::media::set_gpu_frame_budget`), each decoder keeps
+    at most the frames it reserved, and a decoder whose pool does not fit opens without it.
+  - `SkiaFFramesRenderer::gpu_video_frames(false)` turns it off (the CPU conversion is the
+    default of every other path).
+  - The chroma is upsampled bilinearly and centered between the luma samples by Skia, swscale
+    as the stream says (H.264: left). Real footage differs by about 43 dB PSNR (the two
+    encodes of the benchmark clip), hard saturated chroma edges by 32 dB, chroma that changes
+    every other pixel by 22 dB. Use `.gpu_video_frames(false)` when that matters.
+  - Hardware encoders can refuse a session (NVIDIA consumer GPUs allow 8). Before a render
+    the Skia pipeline opens up to two encoders per segment (a segment that ends holds its
+    session while the next one of its generator starts; the driver may print
+    `AuthorizeEncoderSession`) and, when one was refused, runs half as many segments as
+    opened; a segment refused anyway (the driver releases a session late) waits for one to
+    end, at most 60 s. Software encoders and VideoToolbox are not probed.
+  - `cargo test -p fframes_skia_renderer --features vulkan-video --test frame_export_vulkan_decode`
+    renders a clip through this path and compares it with the CPU conversion; it prints why it
+    skips on a machine without Vulkan Video encode and decode (lavapipe).
+
   A backend of your own implements
   `FFramesRenderBackend::negotiate_encoder_input` (a software format or
   `EncoderInput::hardware_frames`) and `encoder_frame_renderer`, which returns libav frames
