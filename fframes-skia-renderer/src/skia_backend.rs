@@ -16,6 +16,7 @@ pub struct SkiaFFramesRenderer<'a, T: SkiaBackend + Sync + Send> {
     pub(crate) pipeline_config: SkiaPipelineConfig,
     pub(crate) backend: &'a T,
     pub(crate) frame_export: SkiaFrameExport,
+    pub(crate) gpu_video_frames: bool,
 }
 
 impl<'a, TSkiaBackend: SkiaBackend> SkiaFFramesRenderer<'a, TSkiaBackend> {
@@ -31,6 +32,7 @@ impl<'a, TSkiaBackend: SkiaBackend> SkiaFFramesRenderer<'a, TSkiaBackend> {
             pipeline_config,
             backend: skia_backend_context,
             frame_export: SkiaFrameExport::default(),
+            gpu_video_frames: true,
         }
     }
 
@@ -47,6 +49,15 @@ impl<'a, TSkiaBackend: SkiaBackend> SkiaFFramesRenderer<'a, TSkiaBackend> {
     /// backend and the encoder support is used, see [`SkiaFrameExport`].
     pub fn frame_export(mut self, frame_export: SkiaFrameExport) -> Self {
         self.frame_export = frame_export;
+        self
+    }
+
+    /// Whether video frames decoded on the GPU are drawn from there when the backend can
+    /// (the Vulkan backend of [`crate::vulkan::SkiaVulkanCtx::new_shared_with_encoder`] with a
+    /// hardware encoder), instead of being downloaded, converted and uploaded again. On by
+    /// default; turn it off to take the CPU conversion, for example to compare the two.
+    pub fn gpu_video_frames(mut self, gpu_video_frames: bool) -> Self {
+        self.gpu_video_frames = gpu_video_frames;
         self
     }
 }
@@ -146,6 +157,7 @@ impl<TBackend: SkiaBackend> FFramesRenderBackend for SkiaFFramesRenderer<'_, TBa
             output: output.as_ref(),
             pipeline_config: self.pipeline_config,
             frame_export: self.frame_export,
+            gpu_video_frames: self.gpu_video_frames,
             render_options,
             skia: self.backend,
             timeline,

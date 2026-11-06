@@ -22,6 +22,9 @@ mod svgr_rasterizer;
 pub use svgr_rasterizer::SkiaSvgrRasterizer;
 
 mod frame_export;
+#[cfg(feature = "vulkan-video")]
+#[doc(hidden)]
+pub use frame_export::vulkan_video::gpu_video_frames_drawn;
 pub use frame_export::{
     FrameExportPath, HardwareFrameTarget, SkiaEncoderFrameRenderer, SkiaFrameExport,
 };

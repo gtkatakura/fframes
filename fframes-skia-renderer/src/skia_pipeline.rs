@@ -74,6 +74,7 @@ pub(crate) struct Pipeline<'p, 'a, 'media, TVideo: Video + Sync + Send, TBackend
     pub(crate) output: &'p Path,
     pub(crate) pipeline_config: SkiaPipelineConfig,
     pub(crate) frame_export: SkiaFrameExport,
+    pub(crate) gpu_video_frames: bool,
     pub(crate) skia: &'p TBackend,
     pub(crate) timeline: &'a ResolvedRenderingTimeline<'a, AudioTimelineSamples>,
     pub(crate) usvg_options: &'a usvgr::Options<'a>,
@@ -130,6 +131,7 @@ pub(crate) fn render<'p, 'a, 'media: 'a, TVideo: Video + Sync + Send, TBackend: 
         output,
         pipeline_config,
         frame_export,
+        gpu_video_frames,
         skia,
         timeline,
         usvg_options,
@@ -177,7 +179,7 @@ pub(crate) fn render<'p, 'a, 'media: 'a, TVideo: Video + Sync + Send, TBackend: 
         })
         .map_err(|err| FFramesRendererError::RenderChunkError(0, err))?;
 
-    let gpu_video_frames = skia.shares_device_with_decoders(&encoder_input);
+    let gpu_video_frames = gpu_video_frames && skia.shares_device_with_decoders(&encoder_input);
     let writer = writer
         .with_encoder_input(encoder_input)
         .with_hardware_encoder(hardware_encoder);

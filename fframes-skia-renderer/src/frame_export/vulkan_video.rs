@@ -34,6 +34,17 @@ use skia_safe::gpu::{
 };
 use skia_safe::yuva_info::{PlaneConfig, Siting, Subsampling};
 use skia_safe::{Image, YUVAInfo, YUVColorSpace};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// How many frames were drawn from the GPU by any context of the process.
+static DRAWN: AtomicU64 = AtomicU64::new(0);
+
+/// The number of decoded video frames drawn from the GPU so far (see the module docs). A frame
+/// that is drawn from its pixels instead is not counted.
+#[doc(hidden)]
+pub fn gpu_video_frames_drawn() -> u64 {
+    DRAWN.load(Ordering::Relaxed)
+}
 
 /// Command buffers for copies that may run on the GPU at once.
 const COPIES_IN_FLIGHT: usize = 8;
@@ -523,7 +534,9 @@ impl GpuVideoSource for VulkanVideoFrames {
             }
 
             let image = yuva_image(context, &self.sets[set], frame);
-            if image.is_none() {
+            if image.is_some() {
+                DRAWN.fetch_add(1, Ordering::Relaxed);
+            } else {
                 self.sets[set].in_use = false;
             }
             image
