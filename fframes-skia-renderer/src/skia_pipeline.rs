@@ -114,8 +114,6 @@ impl BufferPool {
 /// encoder gets a few segments less than that.
 #[cfg(feature = "vulkan-video")]
 const HARDWARE_ENCODER_SESSIONS: usize = 6;
-#[cfg(not(feature = "vulkan-video"))]
-const HARDWARE_ENCODER_SESSIONS: usize = usize::MAX;
 
 /// Lets the video decoders keep their frames on the GPU while it lives.
 #[cfg(feature = "vulkan-video")]
@@ -205,7 +203,8 @@ pub(crate) fn render<'p, 'a, 'media: 'a, TVideo: Video + Sync + Send, TBackend: 
     // Decoded video frames stay on the GPU when the frames are drawn there and read by the
     // encoder; the flag is for the decoders the generators create below.
     #[cfg(feature = "vulkan-video")]
-    let _gpu_video = GpuVideoFrames::enable(encoder_input.is_hardware() && skia.draws_gpu_video_frames());
+    let _gpu_video =
+        GpuVideoFrames::enable(encoder_input.is_hardware() && skia.draws_gpu_video_frames());
 
     // Generators own the segments, so their count also caps how many segments encode at
     // once. Half of the threads keeps the GPU fed and is enough for hardware encoders. A
@@ -216,7 +215,9 @@ pub(crate) fn render<'p, 'a, 'media: 'a, TVideo: Video + Sync + Send, TBackend: 
     // `SOFTWARE_ENCODERS_MEMORY` caps the count (4K stays at half of the threads).
     let generators = (workers / 2).max(1);
     let generators = if hardware_encoder {
-        generators.min(HARDWARE_ENCODER_SESSIONS)
+        #[cfg(feature = "vulkan-video")]
+        let generators = generators.min(HARDWARE_ENCODER_SESSIONS);
+        generators
     } else {
         let frame_bytes = ctx.current_video_size.width
             * ctx.current_video_size.height

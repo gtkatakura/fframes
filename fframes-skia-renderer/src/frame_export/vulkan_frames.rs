@@ -551,8 +551,10 @@ impl VulkanFrameTarget {
         let submit = vk::SubmitInfo2::default()
             .wait_semaphore_infos(&waits)
             .signal_semaphore_infos(&signals);
-        self.queue_lock
-            .locked(|| unsafe { self.device.queue_submit2(self.queue, &[submit], vk::Fence::null()) })
+        self.queue_lock.locked(|| unsafe {
+            self.device
+                .queue_submit2(self.queue, &[submit], vk::Fence::null())
+        })
     }
 }
 

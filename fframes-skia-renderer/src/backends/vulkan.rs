@@ -706,6 +706,8 @@ impl<'a> SkiaFFramesRenderer<'a, SkiaVulkanCtx> {
 /// 0, `fQueue` at 24, `fDeviceFeatures2` at 56. The layout is checked, and the features are
 /// left unset (Skia assumes none) when it is not the expected one.
 #[cfg(feature = "vulkan-video")]
+// The native context is 8-byte aligned and both offsets are multiples of 8.
+#[allow(clippy::cast_ptr_alignment)]
 fn set_device_features(
     backend: &gpu::vk::BackendContext,
     queue: vk::Queue,
@@ -714,7 +716,9 @@ fn set_device_features(
     unsafe {
         let native = *std::ptr::from_ref(backend).cast::<*mut u8>();
         if native.is_null() || *native.add(24).cast::<u64>() != queue.as_raw() {
-            eprintln!("fframes: unexpected Skia VulkanBackendContext layout, device features not set");
+            eprintln!(
+                "fframes: unexpected Skia VulkanBackendContext layout, device features not set"
+            );
             return;
         }
         *native.add(56).cast::<*const c_void>() = features;
@@ -728,10 +732,13 @@ unsafe fn has_ycbcr_conversion(features: *const c_void) -> bool {
         let mut next = features.cast::<vk::BaseOutStructure>();
         while !next.is_null() {
             if (*next).s_type == vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_1_FEATURES {
-                return (*next.cast::<vk::PhysicalDeviceVulkan11Features>()).sampler_ycbcr_conversion
+                return (*next.cast::<vk::PhysicalDeviceVulkan11Features>())
+                    .sampler_ycbcr_conversion
                     == vk::TRUE;
             }
-            if (*next).s_type == vk::StructureType::PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES {
+            if (*next).s_type
+                == vk::StructureType::PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES
+            {
                 return (*next.cast::<vk::PhysicalDeviceSamplerYcbcrConversionFeatures>())
                     .sampler_ycbcr_conversion
                     == vk::TRUE;

@@ -773,7 +773,11 @@ impl FFmpegDecoder {
             let gpu_frames = GPU_VIDEO_FRAMES.load(std::sync::atomic::Ordering::SeqCst);
             // Frames that stay on the GPU are held by the frames being rendered, so the pool
             // needs room for them beside the decoder's own references.
-            let extra_hw_frames = if gpu_frames { buffer_size as i32 + 4 } else { 0 };
+            let extra_hw_frames = if gpu_frames {
+                buffer_size as i32 + 4
+            } else {
+                0
+            };
             let video_stream_info = Self::open_codec_context(fmt_ctx, extra_hw_frames)?;
             let gpu_frames = gpu_frames
                 && video_stream_info.hw_pix_fmt == Some(AVPixelFormat::AV_PIX_FMT_VULKAN);
@@ -975,6 +979,8 @@ impl FFmpegDecoder {
     /// Whether `frame` stays on the GPU: frames of the shared Vulkan device that a backend
     /// draws. The libav frame has to be usable by any queue family (`queue_family` ignored),
     /// otherwise it is transferred as usual.
+    // `data[0]` of a Vulkan frame is the `AVVkFrame` libav allocated.
+    #[allow(clippy::cast_ptr_alignment)]
     unsafe fn keeps_on_gpu(&mut self, frame: *mut AVFrame) -> bool {
         if self.gpu_frames && (*frame).format == AVPixelFormat::AV_PIX_FMT_VULKAN as i32 {
             let vk_frame = (*frame).data[0].cast::<AVVkFrame>();
@@ -992,7 +998,8 @@ impl FFmpegDecoder {
         let hw_pix_fmt = self.video_stream_info.hw_pix_fmt;
         match hw_pix_fmt {
             Some(hw_pix_fmt)
-                if hw_pix_fmt as i32 == (*target_frame).format && !self.keeps_on_gpu(target_frame) =>
+                if hw_pix_fmt as i32 == (*target_frame).format
+                    && !self.keeps_on_gpu(target_frame) =>
             {
                 if (*self.frame_buf.latest_av_frame).format
                     == (AVPixelFormat::AV_PIX_FMT_NONE as i32)

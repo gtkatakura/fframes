@@ -64,7 +64,7 @@ pub(super) fn image(frame: &Arc<GpuVideoFrame>, canvas: &Canvas) -> Option<(Imag
         let frames = (*(*raw).hw_frames_ctx).data.cast::<AVHWFramesContext>();
         let frames_hwctx = &*(*frames).hwctx.cast::<AVVulkanFramesContext>();
         let mut context = canvas.recording_context()?;
-        let ycbcr = ycbcr_conversion(frames, frame)?;
+        let ycbcr = ycbcr_conversion(frames, frame);
 
         if let Some(lock) = frames_hwctx.lock_frame {
             lock(frames, vk_frame);
@@ -194,24 +194,21 @@ fn format_features(frames: *mut AVHWFramesContext, format: i32) -> vk::FormatFea
         let hwctx = &*(*device).hwctx.cast::<AVVulkanDeviceContext>();
         let key = (hwctx.phys_dev as usize as u64, format);
         let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
-        *cache
-            .get_or_insert_default()
-            .entry(key)
-            .or_insert_with(|| {
-                let Some(entry) = ENTRY.get_or_init(|| ash::Entry::load().ok()) else {
-                    return vk::FormatFeatureFlags::empty();
-                };
-                let instance = ash::Instance::load(
-                    entry.static_fn(),
-                    vk::Instance::from_raw(hwctx.inst as usize as u64),
-                );
-                instance
-                    .get_physical_device_format_properties(
-                        vk::PhysicalDevice::from_raw(hwctx.phys_dev as usize as u64),
-                        vk::Format::from_raw(format),
-                    )
-                    .optimal_tiling_features
-            })
+        *cache.get_or_insert_default().entry(key).or_insert_with(|| {
+            let Some(entry) = ENTRY.get_or_init(|| ash::Entry::load().ok()) else {
+                return vk::FormatFeatureFlags::empty();
+            };
+            let instance = ash::Instance::load(
+                entry.static_fn(),
+                vk::Instance::from_raw(hwctx.inst as usize as u64),
+            );
+            instance
+                .get_physical_device_format_properties(
+                    vk::PhysicalDevice::from_raw(hwctx.phys_dev as usize as u64),
+                    vk::Format::from_raw(format),
+                )
+                .optimal_tiling_features
+        })
     }
 }
 
@@ -220,7 +217,7 @@ fn format_features(frames: *mut AVHWFramesContext, format: i32) -> vk::FormatFea
 fn ycbcr_conversion(
     frames: *mut AVHWFramesContext,
     frame: &GpuVideoFrame,
-) -> Option<gpu::vk::YcbcrConversionInfo> {
+) -> gpu::vk::YcbcrConversionInfo {
     use gpu::vk::{ChromaLocation, SamplerYcbcrModelConversion as Model, SamplerYcbcrRange};
     unsafe {
         let raw = frame.as_ptr();
@@ -248,10 +245,10 @@ fn ycbcr_conversion(
             _ => (ChromaLocation::COSITED_EVEN, ChromaLocation::MIDPOINT),
         };
         let features = format_features(frames, format);
-        let linear = features
-            .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER);
+        let linear =
+            features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER);
         let identity = gpu::vk::ComponentSwizzle::VK_COMPONENT_SWIZZLE_IDENTITY;
-        Some(gpu::vk::YcbcrConversionInfo::new_with_format(
+        gpu::vk::YcbcrConversionInfo::new_with_format(
             std::mem::transmute::<u32, gpu::vk::Format>(format as u32),
             model,
             range,
@@ -270,6 +267,6 @@ fn ycbcr_conversion(
                 a: identity,
             },
             features.as_raw(),
-        ))
+        )
     }
 }

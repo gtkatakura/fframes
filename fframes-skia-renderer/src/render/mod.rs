@@ -1154,7 +1154,14 @@ fn render_raster_image(
     #[cfg(feature = "vulkan-video")]
     if let Some(frame) = fframes::resolve_gpu_video_frame(img) {
         if let Some((image, picture)) = gpu_video::image(&frame, canvas) {
-            draw_raster_image(&image, Some(picture), view_box, rendering_mode, canvas, alpha);
+            draw_raster_image(
+                &image,
+                Some(picture),
+                view_box,
+                rendering_mode,
+                canvas,
+                alpha,
+            );
         }
         return;
     }
